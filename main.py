@@ -25,7 +25,7 @@ GEMINI_API_KEY = os.getenv("AIzaSyCexP81od_dlYoO0oETaVKhLumunSFbJJY")
 #   إعداد Gemini API
 # --------------------------
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=AIzaSyCexP81od_dlYoO0oETaVKhLumunSFbJJY)
     model = genai.GenerativeModel("gemini-1.5-flash")
 else:
     logger.error("❌ Gemini API Key missing!")
