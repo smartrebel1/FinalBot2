@@ -10,8 +10,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-FACEBOOK_VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
-FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+FACEBOOK_VERIFY_TOKEN = os.getenv("my_verify_token_123
+")
+FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("EAAc4O5PZCrpoBQH2k5uAbTLbHoUIJULD8raOYaw1SZCI7fYaV5VZCZAVb7XObXbsPOy6OVp6tM5UGESoCOHMFMr2B9iogTy8WwaNclUF0Lu4WydifzVIMP4S1WHmgkE8aDDQfUthC1xkY8ZC7UCsKg5nQqEXGqNfUZAQupP0O5fMJkHdSY9wkW3sCRBgM8pmn9lcX6ClE0jyuqMe9TkQUCwjZCEBQZDZD")
 # GEMINI_API_KEY optional
 
 app = FastAPI()
