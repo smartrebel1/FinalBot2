@@ -7,51 +7,48 @@ from dotenv import load_dotenv
 import uvicorn
 
 # -----------------------------------------------------
-# ⭐ محاولة تحميل Gemini بشكل آمن
+# ⭐ محاولة تحميل Gemini
 # -----------------------------------------------------
 USE_GEMINI = False
 try:
     import google.generativeai as genai
     USE_GEMINI = True
-except Exception as e:
-    print("Gemini not available, fallback to simple mode.")
+except:
+    print("⚠ Gemini not installed — Simple mode only")
 
 # -----------------------------------------------------
-# ⭐ إعداد السجلات
+# ⭐ Logs
 # -----------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------
-# ⭐ تحميل المتغيرات
+# ⭐ Load Environment Variables
 # -----------------------------------------------------
 load_dotenv()
-VERIFY_TOKEN = os.getenv("my_verify_token_123")
-PAGE_TOKEN = os.getenv("EAAc4O5PZCrpoBQPcrJ18mtto24wX01WoDDyvt8VWSIp2YNzdll2NXX3bdrThZBVmRm1H5ghS7JIpqx5tP9iezn6ujjlvqlzp9seAtkA2W1abrW35x2Yt8qBI463XCCfMegZByV9Bo4EF4AJuFHIkvI6mZAUdrzZCIa3I6kAq0g9Wv4E2lX8FQGUdgUwxKjwco7A2jjCeg8OKzMi6aV20PugNibQZDZD")
-GEMINI_KEY = os.getenv("AIzaSyCexP81od_dlYoO0oETaVKhLumunSFbJJY")
 
-# لو في مفتاح Gemini → فعّل
+VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
+PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
 if USE_GEMINI and GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
-    logger.info("✔ Gemini AI Loaded")
+    logger.info("✔ Gemini Enabled")
 else:
-    logger.info("⚠ Gemini Not Available — using Simple Reply Mode")
+    logger.info("⚠ Gemini Not Available — Simple Reply Only")
 
 # -----------------------------------------------------
-# ⭐ إنشاء التطبيق
+# ⭐ FastAPI App
 # -----------------------------------------------------
 app = FastAPI()
 
-# -----------------------------------------------------
-# ⭐ Health Check
-# -----------------------------------------------------
 @app.get("/")
 def home():
     return {"status": "alive"}
 
 # -----------------------------------------------------
-# ⭐ Webhook Verify
+# ⭐ Webhook Verify (GET)
 # -----------------------------------------------------
 @app.get("/webhook")
 def verify(request: Request):
@@ -65,7 +62,7 @@ def verify(request: Request):
     raise HTTPException(status_code=403)
 
 # -----------------------------------------------------
-# ⭐ استقبال رسائل الفيسبوك
+# ⭐ Webhook (POST)
 # -----------------------------------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -74,47 +71,49 @@ async def webhook(request: Request):
     if body.get("object") == "page":
         for entry in body.get("entry", []):
             for event in entry.get("messaging", []):
+
                 if "message" in event and "text" in event["message"]:
                     sender = event["sender"]["id"]
-                    user_msg = event["message"]["text"]
+                    msg = event["message"]["text"]
 
-                    reply = generate_reply(user_msg)
+                    reply = generate_reply(msg)
                     send_message(sender, reply)
 
     return JSONResponse({"status": "ok"})
 
 # -----------------------------------------------------
-# ⭐ قراءة data.txt
+# ⭐ Load Data
 # -----------------------------------------------------
 def load_data():
-    if not os.path.exists("data.txt"):
-        return ""
-    with open("data.txt", "r", encoding="utf-8") as f:
-        return f.read()
+    if os.path.exists("data.txt"):
+        return open("data.txt", "r", encoding="utf-8").read()
+    return ""
 
 DATA_TEXT = load_data()
 
 # -----------------------------------------------------
-# ⭐ إنشاء الرد (Gemini أو بسيط)
+# ⭐ Reply Generator
 # -----------------------------------------------------
 def generate_reply(text):
-    # 🤖 لو Gemini شغّال
+
+    # Gemini AI
     if USE_GEMINI and GEMINI_KEY:
         try:
             prompt = f"""
-            أنت بوت خدمة عملاء حلويات مصر.
-            استخدم هذه المعلومات فقط:
+            أنت بوت دعم عملاء حلويات مصر.
+            استخدم المعلومات التالية فقط للرد:
 
             {DATA_TEXT}
 
             رسالة العميل: {text}
             """
-            result = model.generate_content(prompt)
-            return result.text.strip()
-        except:
-            pass  # لو خطأ استخدم الرد البسيط
 
-    # 💬 رد بسيط باستخدام data.txt
+            out = model.generate_content(prompt)
+            return out.text.strip()
+        except Exception as e:
+            logger.error(f"Gemini Error: {e}")
+
+    # Simple reply
     for line in DATA_TEXT.splitlines():
         if ":" in line:
             key = line.split(":")[0].strip()
@@ -124,22 +123,20 @@ def generate_reply(text):
     return "شكراً لتواصلك! تحت أمرك 😊"
 
 # -----------------------------------------------------
-# ⭐ إرسال الرسائل إلى فيسبوك
+# ⭐ Send Message
 # -----------------------------------------------------
 def send_message(user_id, text):
     url = "https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": PAGE_TOKEN}
     payload = {"recipient": {"id": user_id}, "message": {"text": text}}
 
-    try:
-        r = requests.post(url, params=params, json=payload)
-        if r.status_code != 200:
-            logger.error(f"FB Send Error: {r.text}")
-    except Exception as e:
-        logger.error(f"Exception FB: {e}")
+    r = requests.post(url, params=params, json=payload)
+
+    if r.status_code != 200:
+        logger.error(f"Facebook Error: {r.text}")
 
 # -----------------------------------------------------
-# ⭐ تشغيل السيرفر
+# ⭐ Run Server
 # -----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
