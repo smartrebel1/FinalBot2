@@ -1,47 +1,56 @@
 import os
 import logging
 import requests
-import google.generativeai as genai
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import uvicorn
 
-# --------------------------
-#   إعداد السجلات
-# --------------------------
+# -------------------------------------------------
+# 1) إعداد اللوجز
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --------------------------
-#   تحميل متغيرات البيئة
-# --------------------------
+# -------------------------------------------------
+# 2) تحميل المتغيرات
+# -------------------------------------------------
 load_dotenv()
+
 FACEBOOK_VERIFY_TOKEN = os.getenv("my_verify_token_123")
 FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("EAAc4O5PZCrpoBQPcrJ18mtto24wX01WoDDyvt8VWSIp2YNzdll2NXX3bdrThZBVmRm1H5ghS7JIpqx5tP9iezn6ujjlvqlzp9seAtkA2W1abrW35x2Yt8qBI463XCCfMegZByV9Bo4EF4AJuFHIkvI6mZAUdrzZCIa3I6kAq0g9Wv4E2lX8FQGUdgUwxKjwco7A2jjCeg8OKzMi6aV20PugNibQZDZD")
 GEMINI_API_KEY = os.getenv("AIzaSyCexP81od_dlYoO0oETaVKhLumunSFbJJY")
 
-# --------------------------
-#   إعداد Gemini API
-# --------------------------
-if GEMINI_API_KEY:
-    genai.configure(api_key=AIzaSyCexP81od_dlYoO0oETaVKhLumunSFbJJY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-else:
-    logger.error("❌ Gemini API Key missing!")
+# -------------------------------------------------
+# 3) محاولة تحميل Gemini – اختياري
+# -------------------------------------------------
+use_gemini = False
+model = None
 
-# --------------------------
-#   FastAPI
-# --------------------------
+if GEMINI_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        use_gemini = True
+        logger.info("✔ Gemini model loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Gemini load failed: {e}")
+else:
+    logger.warning("⚠ No GEMINI_API_KEY found — fallback to Simple AI")
+
+# -------------------------------------------------
+# 4) إنشاء التطبيق
+# -------------------------------------------------
 app = FastAPI()
 
 @app.get("/")
 def home():
     return {"status": "alive"}
 
-# --------------------------
-#   Webhook Verification
-# --------------------------
+# -------------------------------------------------
+# 5) Webhook Verification
+# -------------------------------------------------
 @app.get("/webhook")
 def verify(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -50,66 +59,83 @@ def verify(request: Request):
 
     if mode == "subscribe" and token == FACEBOOK_VERIFY_TOKEN:
         return int(challenge)
-    raise HTTPException(status_code=403)
 
-# --------------------------
-#   Webhook Listener
-# --------------------------
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# -------------------------------------------------
+# 6) استقبال الرسائل من فيسبوك
+# -------------------------------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
+    body = await request.json()
 
-    if data.get("object") == "page":
-        for entry in data.get("entry", []):
-            for message in entry.get("messaging", []):
-                
-                if "message" in message and "text" in message["message"]:
+    if body.get("object") == "page":
+        for entry in body.get("entry", []):
+            for event in entry.get("messaging", []):
+                if "message" in event and "text" in event["message"]:
 
-                    sender = message["sender"]["id"]
-                    user_text = message["message"]["text"]
+                    sender = event["sender"]["id"]
+                    user_msg = event["message"]["text"]
 
-                    logger.info(f"User: {user_text}")
+                    # توليد الرد
+                    reply = generate_reply(user_msg)
 
-                    bot_reply = generate_reply(user_text)
-
-                    send_message(sender, bot_reply)
+                    # إرسال الرد لفيسبوك
+                    send_message(sender, reply)
 
     return JSONResponse({"status": "ok"})
 
-# --------------------------
-#   AI Reply (Gemini)
-# --------------------------
+
+# -------------------------------------------------
+# 7) دالة الرد الذكي
+# -------------------------------------------------
 def generate_reply(user_text):
 
-    # تحميل الداتا
-    company_data = ""
+    # --- 1) لو Gemini موجود – استخدمه ---
+    if use_gemini and model:
+        try:
+            data = ""
+            if os.path.exists("data.txt"):
+                data = open("data.txt", encoding="utf8").read()
+
+            prompt = f"""
+            أنت بوت خدمة عملاء حلويات مصر.
+            استخدم المعلومات التالية للرد على أسئلة العملاء:
+
+            {data}
+
+            السؤال: {user_text}
+            اجعل الرد مختصر وواضح وباللهجة المصرية.
+            """
+
+            response = model.generate_content(prompt)
+            return response.text.strip()
+
+        except Exception as e:
+            logger.error(f"Gemini error: {e}")
+
+    # --- 2) لو Gemini مش موجود – Simple AI ---
     if os.path.exists("data.txt"):
-        with open("data.txt", "r", encoding="utf8") as f:
-            company_data = f.read()
+        try:
+            data_lines = open("data.txt", encoding="utf8").read().splitlines()
 
-    prompt = f"""
-أنت بوت خدمة عملاء لشركة حلويات مصر.
-استخدم المعلومات التالية فقط للإجابة:
+            # بحث بسيط في الكلمات
+            for line in data_lines:
+                key = line.split(":")[0].strip()
+                if key and key.lower() in user_text.lower():
+                    return line
+        except:
+            pass
 
-{company_data}
+    return "شكراً لتواصلك! فريق حلويات مصر هيساعدك حالاً 💜"
 
-إذا لم تجد إجابة في المعلومات → استخدم ذكاءك وقدم رد مفيد ومحترم.
 
-سؤال العميل:
-{user_text}
-"""
-
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        logger.error(e)
-        return "حصل عطل بسيط.. حاول تاني بعد لحظة 💜"
-
-# --------------------------
-#   Facebook Send API
-# --------------------------
+# -------------------------------------------------
+# 8) إرسال الرسالة لفيسبوك
+# -------------------------------------------------
 def send_message(user_id, text):
+
     url = "https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": FACEBOOK_PAGE_ACCESS_TOKEN}
     payload = {
@@ -119,14 +145,16 @@ def send_message(user_id, text):
 
     try:
         r = requests.post(url, params=params, json=payload)
-        logger.info(f"FB Response: {r.text}")
+        if r.status_code != 200:
+            logger.error(f"Error sending message: {r.text}")
     except Exception as e:
-        logger.error(f"Send error: {e}")
+        logger.error(f"Send message failed: {e}")
 
 
-# --------------------------
-#   Run on Railway
-# --------------------------
+# -------------------------------------------------
+# 9) تشغيل السيرفر (Railway يستخدم PORT)
+# -------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
+    logger.info(f"🚀 Bot running on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
