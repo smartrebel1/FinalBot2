@@ -6,36 +6,30 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import httpx
 
-# -----------------------------------------------------
-# 🔥 إعداد اللوج
-# -----------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-logger.info("🚀 RUNNING NEW BOT VERSION WITH LLAMA 3.1 INSTANT MODEL")
+logger.info("🚀 BOT RUNNING WITH MIXTRAL-8x7b (HIGH INTELLIGENCE MODE)")
 
-# -----------------------------------------------------
-# تحميل المتغيرات
-# -----------------------------------------------------
 load_dotenv()
 
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# -----------------------------------------------------
-# FastAPI
-# -----------------------------------------------------
+# تحميل بيانات الشركة من data.txt
+COMPANY_DATA = ""
+if os.path.exists("data.txt"):
+    COMPANY_DATA = open("data.txt", "r", encoding="utf8").read()
+
+
 app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"status": "alive", "model": "llama-3.1-8b-instant"}
+    return {"status": "alive", "model": "mixtral-8x7b-32768"}
 
 
-# -----------------------------------------------------
-# ✔ Webhook Verify
-# -----------------------------------------------------
 @app.get("/webhook")
 def verify(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -46,79 +40,79 @@ def verify(request: Request):
         logger.info("✅ Webhook Verified Successfully!")
         return int(challenge)
 
-    logger.warning("❌ Webhook Verification Failed")
     raise HTTPException(status_code=403)
 
 
-# -----------------------------------------------------
-# 🤖 استدعاء Groq LLM
-# -----------------------------------------------------
+# --------------------------
+# 🤖 AI Reply with Mixtral
+# --------------------------
 async def groq_reply(user_message: str) -> str:
+
     if not GROQ_API_KEY:
-        logger.error("❌ No GROQ_API_KEY found — using fallback text")
-        return "عذرًا، السيرفر مش قادر يعالج الرسالة دلوقتي."
+        return "مشكلة في السيرفر حالياً."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
+
+    system_prompt = f"""
+أنت مساعد ذكي يعمل لصفحة (حلويات مصر).
+مهمتك:
+- الرد بدقة ولباقة.
+- الاعتماد فقط على المعلومات التالية، ولا تخترع أي شيء غير موجود:
+
+🔎 بيانات الشركة:
+{COMPANY_DATA}
+
+قواعد مهمة:
+1. لو السؤال خارج بيانات الشركة → قل: "من فضلك اسأل عن المنيو أو الفروع أو الأسعار أو الطلبات."
+2. لا تقدم أي معلومة غير موجودة.
+3. اختصر الردود قدر الإمكان.
+"""
+
+    payload = {
+        "model": "mixtral-8x7b-32768",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+    }
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {
-                "role": "system",
-                "content": "أنت مساعد ذكي لصفحة (حلويات مصر). رد بشكل مختصر ومفيد وباحترام."
-            },
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ]
-    }
-
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(url, headers=headers, json=payload)
 
-        full_json = response.json()
-        logger.error(f"🔥 Groq FULL Response: {full_json}")
+        data = response.json()
+        logger.error(f"🔥 Groq Full Response: {data}")
 
         if response.status_code != 200:
-            return "عذرًا، فيه مشكلة في السيرفر دلوقتي."
+            return "السيرفر مشغول حالياً."
 
-        ai_text = full_json["choices"][0]["message"]["content"]
-        return ai_text
+        return data["choices"][0]["message"]["content"]
 
     except Exception as e:
-        logger.error(f"❌ Groq Exception: {e}")
-        return "عذرًا، حصل خطأ أثناء المعالجة."
+        logger.error(f"❌ AI Error: {e}")
+        return "عذراً، حدث خطأ أثناء المعالجة."
 
 
-# -----------------------------------------------------
-# ✉ إرسال رسالة للماسنجر
-# -----------------------------------------------------
-def send_message(user_id: str, text: str):
+# --------------------------
+# ✉ إرسال الرسائل
+# --------------------------
+def send_message(user_id, text):
     url = "https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": PAGE_TOKEN}
-
-    payload = {
-        "recipient": {"id": user_id},
-        "message": {"text": text}
-    }
+    payload = {"recipient": {"id": user_id}, "message": {"text": text}}
 
     try:
         r = requests.post(url, params=params, json=payload)
         logger.info(f"📤 Sent: {text[:50]} | Status: {r.status_code}")
     except Exception as e:
-        logger.error(f"🔥 Facebook Send Error: {e}")
+        logger.error(f"🔥 FB Send Error: {e}")
 
 
-# -----------------------------------------------------
-# 📩 استقبال الرسائل من ماسنجر
-# -----------------------------------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
@@ -126,17 +120,13 @@ async def webhook(request: Request):
 
     if body.get("object") == "page":
         for entry in body.get("entry", []):
-            for messaging_event in entry.get("messaging", []):
+            for event in entry.get("messaging", []):
 
-                # 👤 رسالة نصية واردة
-                if "message" in messaging_event and "text" in messaging_event["message"]:
-                    sender = messaging_event["sender"]["id"]
-                    text = messaging_event["message"]["text"]
+                if "message" in event and "text" in event["message"]:
+                    sender = event["sender"]["id"]
+                    text = event["message"]["text"]
 
-                    logger.info(f"👤 User {sender} says: {text}")
-
-                    ai_reply = await groq_reply(text)
-
-                    send_message(sender, ai_reply)
+                    reply = await groq_reply(text)
+                    send_message(sender, reply)
 
     return JSONResponse({"status": "ok"})
