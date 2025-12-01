@@ -114,10 +114,12 @@ def ai_reply(user_text):
         r = requests.post(url, headers=headers, json=payload)
         res = r.json()
 
+        # 🔥 Debug يساعدنا نعرف المشكلة الحقيقية
+        logger.error(f"🔥 Groq Full Response: {res}")
+
         if "choices" in res:
             return res["choices"][0]["message"]["content"]
 
-        logger.error(f"Groq Error Response: {res}")
         return "عذرًا، فيه مشكلة في المعالجة دلوقتي."
 
     except Exception as e:
@@ -150,4 +152,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     logger.info(f"🚀 Starting on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
