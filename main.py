@@ -6,34 +6,34 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 
-# --------------------------------------------
-# إعداد اللوج
-# --------------------------------------------
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------
-# تحميل المتغيرات من Railway
-# --------------------------------------------
+# -----------------------------
+# Environment Variables
+# -----------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FACEBOOK_VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
-DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# --------------------------------------------
-# إنشاء تطبيق FastAPI
-# --------------------------------------------
+# -----------------------------
+# FastAPI App
+# -----------------------------
 app = FastAPI()
 
-# ---------------------------------------------------
-# نقطة الفحص الأساسية — Railway Health Check
-# ---------------------------------------------------
+# -----------------------------
+# Railway Health Check
+# -----------------------------
 @app.get("/")
 def home():
-    return {"status": "alive", "message": "Misr Sweets Bot Running"}
+    return {"status": "alive", "message": "Groq LLaMA3 Bot Running"}
 
-# ---------------------------------------------------
-# التحقق من Webhook (Facebook Verification Step)
-# ---------------------------------------------------
+# -----------------------------
+# Facebook Webhook Verification
+# -----------------------------
 @app.get("/webhook")
 def verify(request: Request):
 
@@ -47,69 +47,63 @@ def verify(request: Request):
 
     raise HTTPException(status_code=403, detail="Verification failed")
 
-# ---------------------------------------------------
-# استقبال الرسائل من Facebook
-# ---------------------------------------------------
+# -----------------------------
+# Receive Messages from Facebook
+# -----------------------------
 @app.post("/webhook")
 async def webhook(request: Request):
-
     body = await request.json()
     logger.info(f"📩 Incoming Event: {body}")
 
     if body.get("object") == "page":
         for entry in body.get("entry", []):
-            for messaging_event in entry.get("messaging", []):
+            for event in entry.get("messaging", []):
+                if "message" in event and "text" in event["message"]:
+                    sender_id = event["sender"]["id"]
+                    text_received = event["message"]["text"]
 
-                # هل الرسالة تحتوي على نص؟
-                if "message" in messaging_event and "text" in messaging_event["message"]:
+                    logger.info(f"👤 User {sender_id} says: {text_received}")
 
-                    sender_id = messaging_event["sender"]["id"]
-                    received_text = messaging_event["message"]["text"]
+                    reply_text = ai_reply(text_received)
 
-                    logger.info(f"👤 User: {sender_id} | Message: {received_text}")
-
-                    # توليد الرد باستخدام الذكاء الاصطناعي
-                    reply = ai_response(received_text)
-
-                    # إرسال الرد إلى فيسبوك
-                    send_message(sender_id, reply)
+                    send_message(sender_id, reply_text)
 
     return JSONResponse({"status": "ok"}, status_code=200)
 
-# ---------------------------------------------------
-# ذكاء DeepSeek — الرد على الرسائل
-# ---------------------------------------------------
-def ai_response(user_text):
+# -----------------------------
+# AI Reply using Groq (LLaMA3)
+# -----------------------------
+def ai_reply(user_text):
 
-    # قراءة بيانات الشركة من data.txt
-    company_data = ""
+    # Load company data
+    data = ""
     if os.path.exists("data.txt"):
         with open("data.txt", "r", encoding="utf-8") as f:
-            company_data = f.read()
+            data = f.read()
 
     prompt = f"""
 أنت بوت خدمة عملاء لمحل "حلويات مصر".
-هنا بيانات الشركة:
+هذه بيانات الشركة:
 
-{company_data}
+{data}
 
 التعليمات:
-- الرد يكون ودي ومختصر.
-- عدم اختراع معلومات غير موجودة.
-- الاعتماد فقط على البيانات المكتوبة فوق.
-- الرد باللهجة المصرية.
+- الرد يكون مختصر ومباشر.
+- الود مهم.
+- استخدم المعلومات فقط، ولا تخترع بيانات جديدة.
+- تحدث باللهجة المصرية.
 سؤال العميل: {user_text}
 """
 
-    url = "https://api.deepseek.com/v1/chat/completions"
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_KEY}"
+        "Authorization": f"Bearer {GROQ_API_KEY}"
     }
 
     payload = {
-        "model": "deepseek-chat",
+        "model": "llama3-8b-8192",
         "messages": [
             {"role": "system", "content": "أنت مساعد خدمة عملاء محترف."},
             {"role": "user", "content": prompt}
@@ -117,23 +111,22 @@ def ai_response(user_text):
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        result = response.json()
+        r = requests.post(url, headers=headers, json=payload)
+        res = r.json()
 
-        if "choices" in result:
-            reply_text = result["choices"][0]["message"]["content"]
-            return reply_text
+        if "choices" in res:
+            return res["choices"][0]["message"]["content"]
 
-        logger.error(f"DeepSeek Error Response: {result}")
-        return "عذرًا، فيه مشكلة في المعالجة دلوقتي. حاول تاني."
+        logger.error(f"Groq Error Response: {res}")
+        return "عذرًا، فيه مشكلة في المعالجة دلوقتي."
 
     except Exception as e:
-        logger.error(f"DeepSeek Error: {e}")
+        logger.error(f"Groq Error: {e}")
         return "في مشكلة تقنية دلوقتي — حاول بعد شوية."
 
-# ---------------------------------------------------
-# إرسال الرسائل إلى Facebook Messenger
-# ---------------------------------------------------
+# -----------------------------
+# Send Reply to Facebook
+# -----------------------------
 def send_message(user_id, text):
 
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={FACEBOOK_PAGE_ACCESS_TOKEN}"
@@ -145,15 +138,16 @@ def send_message(user_id, text):
 
     try:
         r = requests.post(url, json=payload)
-        logger.info(f"📤 Sent: {text[:50]}... | Status: {r.status_code}")
+        logger.info(f"📤 Sent: {text[:40]}... | Status: {r.status_code}")
 
     except Exception as e:
-        logger.error(f"FB Send Error: {e}")
+        logger.error(f"Facebook Send Error: {e}")
 
-# ---------------------------------------------------
-# تشغيل السيرفر على Railway
-# ---------------------------------------------------
+# -----------------------------
+# Run on Railway Port
+# -----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    logger.info(f"🚀 Starting server on port {port}")
+    logger.info(f"🚀 Starting on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
