@@ -24,9 +24,6 @@ FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
 # -----------------------------
 app = FastAPI()
 
-# -----------------------------
-# Railway Health Check
-# -----------------------------
 @app.get("/")
 def home():
     return {"status": "alive", "message": "Groq LLaMA3 Bot Running"}
@@ -71,7 +68,7 @@ async def webhook(request: Request):
     return JSONResponse({"status": "ok"}, status_code=200)
 
 # -----------------------------
-# AI Reply using Groq (LLaMA3)
+# AI Reply using Groq (New LLaMA Model)
 # -----------------------------
 def ai_reply(user_text):
 
@@ -103,7 +100,7 @@ def ai_reply(user_text):
     }
 
     payload = {
-        "model": "llama3-8b-8192",
+        "model": "llama-3.1-8b-instant",
         "messages": [
             {"role": "system", "content": "أنت مساعد خدمة عملاء محترف."},
             {"role": "user", "content": prompt}
@@ -114,7 +111,6 @@ def ai_reply(user_text):
         r = requests.post(url, headers=headers, json=payload)
         res = r.json()
 
-        # 🔥 Debug يساعدنا نعرف المشكلة الحقيقية
         logger.error(f"🔥 Groq Full Response: {res}")
 
         if "choices" in res:
