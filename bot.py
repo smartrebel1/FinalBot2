@@ -9,7 +9,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-logger.info("🚀 BOT RUNNING WITH MIXTRAL-8x7b (HIGH INTELLIGENCE MODE)")
+logger.info("🚀 BOT RUNNING WITH llama-3.2-90b-text-preview (NEW GROQ MODEL)")
 
 load_dotenv()
 
@@ -25,9 +25,13 @@ if os.path.exists("data.txt"):
 
 app = FastAPI()
 
+
 @app.get("/")
 def home():
-    return {"status": "alive", "model": "mixtral-8x7b-32768"}
+    return {
+        "status": "alive",
+        "model": "llama-3.2-90b-text-preview"
+    }
 
 
 @app.get("/webhook")
@@ -44,7 +48,7 @@ def verify(request: Request):
 
 
 # --------------------------
-# 🤖 AI Reply with Mixtral
+# 🤖 AI Reply (Groq)
 # --------------------------
 async def groq_reply(user_message: str) -> str:
 
@@ -54,22 +58,22 @@ async def groq_reply(user_message: str) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     system_prompt = f"""
-أنت مساعد ذكي يعمل لصفحة (حلويات مصر).
-مهمتك:
-- الرد بدقة ولباقة.
-- الاعتماد فقط على المعلومات التالية، ولا تخترع أي شيء غير موجود:
+أنت مساعد محترف يعمل لصالح (حلويات مصر).
 
-🔎 بيانات الشركة:
+مهمتك:
+- الرد على العملاء بأقصى دقة.
+- استخدم **فقط** المعلومات التالية من الشركة:
+
 {COMPANY_DATA}
 
 قواعد مهمة:
-1. لو السؤال خارج بيانات الشركة → قل: "من فضلك اسأل عن المنيو أو الفروع أو الأسعار أو الطلبات."
-2. لا تقدم أي معلومة غير موجودة.
-3. اختصر الردود قدر الإمكان.
+1. لا تخترع أي معلومة غير موجودة.
+2. لو العميل سأل عن شيء مش موجود → رد: "السؤال خارج نطاق المعلومات المتاحة."
+3. الردود قصيرة، محترمة، وواضحة.
 """
 
     payload = {
-        "model": "mixtral-8x7b-32768",
+        "model": "llama-3.2-90b-text-preview",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
@@ -99,7 +103,7 @@ async def groq_reply(user_message: str) -> str:
 
 
 # --------------------------
-# ✉ إرسال الرسائل
+# ✉ إرسال رسالة للماسنجر
 # --------------------------
 def send_message(user_id, text):
     url = "https://graph.facebook.com/v19.0/me/messages"
