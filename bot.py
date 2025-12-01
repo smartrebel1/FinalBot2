@@ -39,6 +39,8 @@ async def webhook(request: Request):
     if body.get("object") == "page":
         for entry in body.get("entry", []):
             for event in entry.get("messaging", []):
+                
+                # لو رسالة نصية
                 if "message" in event and "text" in event["message"]:
                     sender = event["sender"]["id"]
                     msg = event["message"]["text"]
@@ -52,9 +54,11 @@ async def webhook(request: Request):
 
 # الذكاء الاصطناعي
 def ai_reply(user_message):
+    # لو مفيش مفتاح API → نرجع رد بسيط
     if not GROQ_API_KEY:
         return "شكراً لتواصلك! يسعدنا الرد عليك في أي وقت 💜"
 
+    # URL الخاص بـ Groq
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     headers = {
@@ -62,11 +66,18 @@ def ai_reply(user_message):
         "Content-Type": "application/json"
     }
 
+    # الموديل الجديد المدعوم رسميًا
     payload = {
-        "model": "llama3-70b-8192",
+        "model": "mixtral-8x7b-32768",
         "messages": [
-            {"role": "system", "content": "أنت بوت خدمة عملاء لحلويات مصر. كن ودوداً وأجب من data.txt إذا وُجد."},
-            {"role": "user", "content": user_message}
+            {
+                "role": "system",
+                "content": "أنت بوت خدمة عملاء لحلويات مصر. كن ودوداً، واجب من المعلومات المخزنة في data.txt إن وجدت."
+            },
+            {
+                "role": "user",
+                "content": user_message
+            }
         ]
     }
 
@@ -74,17 +85,19 @@ def ai_reply(user_message):
         r = requests.post(url, json=payload, headers=headers)
         data = r.json()
 
+        # لو الرد طبيعي
         if "choices" in data:
             return data["choices"][0]["message"]["content"]
 
-        logger.error(f"🔥 Groq error: {data}")
-        return "عذرًا، فيه مشكلة في المعالجة دلوقتي...."
+        # لو في خطأ من Groq
+        logger.error(f"🔥 Groq Error: {data}")
+        return "عذرًا، حصل خطأ أثناء المعالجة.. حاول تاني 💜"
 
     except Exception as e:
         logger.error(f"AI error: {e}")
         return "حصل خطأ بسيط.. حاول تاني 💜"
 
-# إرسال الرسالة لفيسبوك
+# إرسال الرد لفيسبوك
 def send_message(user_id, text):
     url = "https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": FACEBOOK_PAGE_ACCESS_TOKEN}
@@ -94,9 +107,9 @@ def send_message(user_id, text):
     }
 
     r = requests.post(url, params=params, json=payload)
-    logger.info(f"📤 Sent: {text[:30]} | Status: {r.status_code}")
+    logger.info(f"📤 Sent: {text[:40]} | Status: {r.status_code}")
 
-# تشغيل التطبيق محليًا (اختياري)
+# تشغيل التطبيق محلياً
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
