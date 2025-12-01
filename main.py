@@ -6,50 +6,52 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import uvicorn
 
-# -----------------------------------------------------
-# ⭐ محاولة تحميل Gemini
-# -----------------------------------------------------
-USE_GEMINI = False
-try:
-    import google.generativeai as genai
-    USE_GEMINI = True
-except:
-    print("⚠ Gemini not installed — Simple mode only")
-
-# -----------------------------------------------------
-# ⭐ Logs
-# -----------------------------------------------------
+# ---------------------- LOGGING ----------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------
-# ⭐ Load Environment Variables
-# -----------------------------------------------------
+# ---------------------- LOAD ENV ----------------------
 load_dotenv()
 
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-if USE_GEMINI and GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    logger.info("✔ Gemini Enabled")
-else:
-    logger.info("⚠ Gemini Not Available — Simple Reply Only")
+if not VERIFY_TOKEN:
+    logger.error("❌ FACEBOOK_VERIFY_TOKEN not found!")
+if not PAGE_TOKEN:
+    logger.error("❌ FACEBOOK_PAGE_ACCESS_TOKEN not found!")
+if not OPENAI_KEY:
+    logger.warning("⚠ No OPENAI_API_KEY — replies will be simple only")
 
-# -----------------------------------------------------
-# ⭐ FastAPI App
-# -----------------------------------------------------
+# ---------------------- OPENAI (ChatGPT) ----------------------
+use_chatgpt = False
+openai_client = None
+
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_KEY)
+    use_chatgpt = True
+    logger.info("✔ ChatGPT API enabled")
+except Exception as e:
+    logger.error(f"❌ ChatGPT import failed: {e}")
+
+# ---------------------- LOAD DATA ----------------------
+def load_data():
+    if os.path.exists("data.txt"):
+        return open("data.txt", "r", encoding="utf-8").read()
+    return ""
+
+DATA = load_data()
+
+# ---------------------- FASTAPI APP ----------------------
 app = FastAPI()
 
 @app.get("/")
 def home():
     return {"status": "alive"}
 
-# -----------------------------------------------------
-# ⭐ Webhook Verify (GET)
-# -----------------------------------------------------
+# ---------------------- VERIFY WEBHOOK ----------------------
 @app.get("/webhook")
 def verify(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -59,11 +61,9 @@ def verify(request: Request):
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return int(challenge)
 
-    raise HTTPException(status_code=403)
+    raise HTTPException(status_code=403, detail="Forbidden")
 
-# -----------------------------------------------------
-# ⭐ Webhook (POST)
-# -----------------------------------------------------
+# ---------------------- RECEIVE MESSAGES ----------------------
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
@@ -75,69 +75,65 @@ async def webhook(request: Request):
                 if "message" in event and "text" in event["message"]:
                     sender = event["sender"]["id"]
                     msg = event["message"]["text"]
-
                     reply = generate_reply(msg)
                     send_message(sender, reply)
 
     return JSONResponse({"status": "ok"})
 
-# -----------------------------------------------------
-# ⭐ Load Data
-# -----------------------------------------------------
-def load_data():
-    if os.path.exists("data.txt"):
-        return open("data.txt", "r", encoding="utf-8").read()
-    return ""
-
-DATA_TEXT = load_data()
-
-# -----------------------------------------------------
-# ⭐ Reply Generator
-# -----------------------------------------------------
+# ---------------------- CREATE REPLY ----------------------
 def generate_reply(text):
 
-    # Gemini AI
-    if USE_GEMINI and GEMINI_KEY:
+    # ====== ChatGPT MODE ======
+    if use_chatgpt and OPENAI_KEY:
         try:
             prompt = f"""
-            أنت بوت دعم عملاء حلويات مصر.
-            استخدم المعلومات التالية فقط للرد:
+            أنت بوت خدمة عملاء "حلويات مصر".
+            استخدم المعلومات التالية للرد بشكل دقيق:
 
-            {DATA_TEXT}
+            {DATA}
 
             رسالة العميل: {text}
+
+            الرد يجب أن يكون عربي بسيط وواضح.
             """
 
-            out = model.generate_content(prompt)
-            return out.text.strip()
-        except Exception as e:
-            logger.error(f"Gemini Error: {e}")
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
 
-    # Simple reply
-    for line in DATA_TEXT.splitlines():
-        if ":" in line:
-            key = line.split(":")[0].strip()
-            if key in text:
-                return line
+            answer = response.choices[0].message.content
+            return answer.strip()
+
+        except Exception as e:
+            logger.error(f"ChatGPT Error: {e}")
+
+    # ====== SIMPLE MODE ======
+    try:
+        for line in DATA.splitlines():
+            if ":" in line:
+                key = line.split(":")[0].strip()
+                if key and key in text:
+                    return line
+    except:
+        pass
 
     return "شكراً لتواصلك! تحت أمرك 😊"
 
-# -----------------------------------------------------
-# ⭐ Send Message
-# -----------------------------------------------------
+# ---------------------- SEND MESSAGE TO FACEBOOK ----------------------
 def send_message(user_id, text):
     url = "https://graph.facebook.com/v19.0/me/messages"
     params = {"access_token": PAGE_TOKEN}
-    payload = {"recipient": {"id": user_id}, "message": {"text": text}}
+    payload = {
+        "recipient": {"id": user_id},
+        "message": {"text": text}
+    }
 
     r = requests.post(url, params=params, json=payload)
-
     if r.status_code != 200:
         logger.error(f"Facebook Error: {r.text}")
 
-# -----------------------------------------------------
-# ⭐ Run Server
-# -----------------------------------------------------
+# ---------------------- RUN SERVER ----------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     uvicorn.run(app, host="0.0.0.0", port=port)
