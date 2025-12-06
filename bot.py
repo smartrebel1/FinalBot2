@@ -1,386 +1,327 @@
 # bot.py
+# نسخة متكاملة لبوت فيسبوك (FastAPI) + بحث ذكي في data.txt + memory + STOP
 import os
-import re
-import time
-import json
 import logging
 import requests
-from difflib import get_close_matches
-from typing import Optional
+import difflib
+import json
+import time
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
 import httpx
+import uvicorn
+from typing import Dict, Tuple, List
 
-# ---------- logging ----------
+# ----- إعداد الـ logger -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
 logger = logging.getLogger("bot")
-logger.info("🚀 BOT RUNNING WITH LLAMA-3.3-70B-VERSATILE (GROQ)")
+logger.info("🚀 RUNNING NEW BOT VERSION - CATEGORY DATA MODE (A)")
 
-# ---------- load env safely ----------
-from dotenv import load_dotenv
-try:
-    load_dotenv()
-except Exception:
-    # if python-dotenv missing or .env absent, continue gracefully
-    logger.debug("dotenv not loaded or not available - continuing")
+# ----- تحميل المتغيرات -----
+load_dotenv()
+VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN", "my_verify_token_123")
+PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")
+# استخدم أي مزوّد AI: إما OPENAI أو GROQ أو DeepSeek — لو مش حاطط مفتاح، البوت يشتغل بقواعد محلية.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# خيارات
+AI_PROVIDER = os.getenv("AI_PROVIDER", "OPENAI")  # OPENAI | GROQ | NONE
 
-VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN")
-PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN") or os.getenv("PAGE_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-PORT = int(os.getenv("PORT", 8080))
-
-# ---------- constants ----------
 DATA_FILE = "data.txt"
 MEMORY_FILE = "memory.txt"
-PAUSE_FILE = "paused.json"  # keep paused users
-MENU_TEXT = (
-    "📋 تقدر تشوف المنيو هنا:\n"
-    "منيو الحلويات المصرية: https://photos.app.goo.gl/g9TAxC6JVSDzgiJz5\n"
-    "منيو الحلويات الشرقية: https://photos.app.goo.gl/vjpdMm5fWB2uEJLR8\n"
-    "منيو التورت والحلويات الفرنسية: https://photos.app.goo.gl/SC4yEAHKjpSLZs4z5\n"
-    "منيو المخبوزات والبسكويت: https://photos.app.goo.gl/YHS319dQxRBsnFdt5\n"
-    "منيو الشيكولاتات والكراميل: https://photos.app.goo.gl/6JhJdUWLaTPTn1GNA\n"
-    "منيو الآيس كريم والعصائر والكاسات: https://photos.app.goo.gl/boJuPbMUwUzRiRQw8\n"
-    "منيو الكافيه: https://photos.app.goo.gl/G4hjcQA56hwgMa4J8\n"
-    "جميع الكتالوجات: https://misrsweets.com/catalogs/\n"
-)
+PAUSE_FILE = "paused.json"   # لحفظ حالة STOP للمستخدمين (persist)
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.65))
 
-# ---------- helper utils ----------
-def safe_read(path: str) -> str:
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        logger.error(f"Failed to read {path}: {e}")
-        return ""
+app = FastAPI(title="MisrSweets Bot")
 
-def safe_write(path: str, text: str):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-    except Exception as e:
-        logger.error(f"Failed to write {path}: {e}")
-
-def load_paused():
+# ----- تحميل الحالات الموقوفة (paused users) -----
+def load_paused() -> Dict[str, float]:
     if os.path.exists(PAUSE_FILE):
         try:
-            return json.loads(safe_read(PAUSE_FILE)) or {}
+            return json.load(open(PAUSE_FILE, "r", encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
 def save_paused(d):
-    safe_write(PAUSE_FILE, json.dumps(d, ensure_ascii=False, indent=2))
+    json.dump(d, open(PAUSE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-PAUSED = load_paused()  # dict of user_id -> {"paused":True, "since":timestamp}
+paused_users = load_paused()
 
-# ---------- data parsing / search ----------
-def parse_price_from_lines(lines, index):
-    """Try to find a number/price on the same line or following lines near index."""
-    # search current line and up to next 3 lines
-    for i in range(index, min(len(lines), index + 4)):
-        line = lines[i]
-        # look for numbers like 1,435.00 or 1435.00 or 1350
-        m = re.search(r"(\d{1,3}(?:[,\d]{0,})?(?:\.\d{1,2})?)", line.replace("٬", "").replace("٫", "."))
-        if m:
-            price = m.group(1).replace(",", "")
-            # try detect unit (KG, Unit, قطعة, ك)
-            unit = None
-            if re.search(r"\bKG\b|\bKg\b|\bك\b|كجم|كيلو", line, re.IGNORECASE):
-                unit = "KG"
-            elif re.search(r"\bUnit\b|\bقطعة\b|\bقط\b|\bوحدة\b", line, re.IGNORECASE):
-                unit = "Unit"
+# ----- تحميل البيانات من data.txt بشكل منظم -----
+# نتوقع data.txt بصيغة: CATEGORY | SKU | ITEM NAME | UNIT | PRICE
+def load_data() -> Dict[str, Dict[str, Dict]]:
+    data = {}
+    if not os.path.exists(DATA_FILE):
+        logger.warning("data.txt not found.")
+        return data
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # نتعامل مع الفاصل " | "
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 5:
+                # محاولة دعم خطوط قديمة: CATEGORY | ITEM — PRICE — UNIT
+                # إذن نعالج بأمان
+                # إذا كان طول 3: category|item|price
+                if len(parts) == 3:
+                    cat, name, price = parts
+                    sku = ""
+                    unit = ""
+                else:
+                    continue
             else:
-                # try to find unit on next tokens
-                pass
-            return price, unit
-    return None, None
+                cat, sku, name, unit, price = parts[:5]
+            if not cat:
+                cat = "عام"
+            data.setdefault(cat, {})
+            # المفتاح للبحث: name lowercase
+            key = name.strip()
+            data[cat][key] = {"sku": sku, "name": name, "unit": unit, "price": price}
+    return data
 
-def build_search_index(data_text: str):
-    """
-    Build a simple index: list of product names and their context lines for fuzzy match.
-    We'll split data_text into lines and keep them.
-    """
-    lines = [l.strip() for l in data_text.splitlines() if l.strip()]
-    # product_names: collect tokens before numeric price, or whole short lines
-    products = []
-    for i, line in enumerate(lines):
-        # if line contains Arabic letters and also a number -> could be product+price; keep product part
-        if re.search(r"[0-9]\s*$", line):  # line ends with a number
-            # split by double spaces or tabs
-            p = re.split(r"\s{2,}|\t|\|", line)[0].strip()
-            if p:
-                products.append((p, i, line))
-        else:
-            # if line short (<40) and contains letters, consider as candidate name
-            if len(line) < 80 and re.search(r"[ء-يA-Za-z]", line):
-                products.append((line, i, line))
-    # also include entire data_text as fallback
-    return lines, products
+# تحميل الميموري (ملف بسيط للنصوص)
+def load_memory() -> str:
+    if os.path.exists(MEMORY_FILE):
+        return open(MEMORY_FILE, "r", encoding="utf-8").read()
+    return ""
 
-def find_best_match(query: str, products, n=5):
-    # extract only names
-    names = [p[0] for p in products]
-    query_norm = query.strip().lower()
-    # exact substring match first
-    matches = []
-    for name, idx, raw in products:
-        if query_norm in name.lower():
-            matches.append((name, idx, raw))
-    if matches:
-        return matches
-    # fuzzy using difflib
-    close = get_close_matches(query_norm, names, n=n, cutoff=0.6)
+def append_memory(line: str):
+    # يحفظ سطرًا جديدًا في memory.txt
+    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+        f.write(line.rstrip() + "\n")
+
+data_index = load_data()
+memory_text = load_memory()
+
+# ----- وظائف البحث الذكي -----
+def all_item_names() -> List[str]:
+    names = []
+    for cat in data_index:
+        names.extend(list(data_index[cat].keys()))
+    return names
+
+def find_best_match(query: str) -> Tuple[str, float, str]:
+    """
+    يرجع: (matched_name, score, category)
+    يستخدم difflib SequenceMatcher عبر جميع الأسماء.
+    """
+    query = query.strip().lower()
+    candidates = all_item_names()
+    if not candidates:
+        return "", 0.0, ""
+    # استخدم get_close_matches أو ratio
+    best = ("", 0.0, "")
+    for cat in data_index:
+        for name in data_index[cat]:
+            score = difflib.SequenceMatcher(None, query, name.lower()).ratio()
+            if score > best[1]:
+                best = (name, score, cat)
+    return best
+
+def search_in_data(query: str):
+    """
+    بحث مباشر: لو اسم الصنف ظاهر ككلمة داخل الاسم.
+    """
+    q = query.strip().lower()
     results = []
-    for c in close:
-        for name, idx, raw in products:
-            if name == c:
-                results.append((name, idx, raw))
-                break
+    for cat in data_index:
+        for name, info in data_index[cat].items():
+            if q == name.lower() or q in name.lower():
+                results.append((cat, name, info))
     return results
 
-# ---------- AI / LLM call (optional) ----------
-async def call_groq(prompt: str, model: str = "mixtral-8x7b-32768", retries: int = 2, timeout: int = 15):
+# ----- صياغة الردود -----
+MENU_LINKS_TEXT = """منيو الحلويات المصرية: https://photos.app.goo.gl/g9TAxC6JVSDzgiJz5
+منيو الحلويات الشرقية: https://photos.app.goo.gl/vjpdMm5fWB2uEJLR8
+منيو التورت والحلويات الفرنسية: https://photos.app.goo.gl/SC4yEAHKjpSLZs4z5
+منيو المخبوزات والبسكويت: https://photos.app.goo.gl/YHS319dQxRBsnFdt5
+منيو الشيكولاتات والكراميل: https://photos.app.goo.gl/6JhJdUWLaTPTn1GNA
+منيو الآيس كريم والعصائر والكاسات: https://photos.app.goo.gl/boJuPbMUwUzRiRQw8
+منيو الكافيه: https://photos.app.goo.gl/G4hjcQA56hwgMa4J8
+جميع الكتالوجات: https://misrsweets.com/catalogs/"""
+
+def format_item_response(cat: str, name: str, info: Dict) -> str:
+    price = info.get("price", "غير متاح")
+    unit = info.get("unit", "غير متاح")
+    lines = []
+    # إيموجي خفيف
+    lines.append(f"🧾 {name}")
+    lines.append(f"💰 السعر: {price}")
+    lines.append(f"📦 الوحدة: {unit}")
+    lines.append(f"🏬 القسم: {cat}")
+    return "\n".join(lines)
+
+def fallback_menu_response() -> str:
+    s = "هذا ملخص المنيو والكتالوجات عندنا — تقدر تشوف القوائم كاملة هنا: \n\n"
+    s += MENU_LINKS_TEXT
+    s += "\n\n📩 لو عايز سعر صنف معين اكتب اسم الصنف تقريبًا، ولو حبيت أأكد سعر معين اكتب: تأكيد سعر <اسم الصنف> — علشان أضيفه للذاكرة."
+    return s
+
+# ----- AI / Generator (اختياري) -----
+async def ai_refine_reply(raw_prompt: str) -> str:
     """
-    Non-blocking call to Groq/OpenAI-style endpoint.
-    If GROQ_API_KEY missing, return None gracefully.
+    واجهة اختيارية لموديل خارجي (OpenAI أو Groq).
+    لو المفتاح غير متوفر، ترجع raw_prompt مباشرة أو يتم تبسيطها.
     """
-    if not GROQ_API_KEY:
-        logger.debug("GROQ_API_KEY not set - skipping LLM call")
-        return None
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 400
-    }
-    for attempt in range(retries):
+    if AI_PROVIDER.upper() == "OPENAI" and OPENAI_API_KEY:
+        # استخدم OpenAI Chat Completions v1
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        payload = {
+            "model": "gpt-4o-mini",  # تغيير حسب حسابك
+            "messages": [
+                {"role": "system", "content": "أجب بالعربية باللهجة المصرية وباختصار، استخدم المعلومات المقدمة فقط."},
+                {"role": "user", "content": raw_prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 400
+        }
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(url, json=payload, headers=headers)
                 if r.status_code == 200:
                     j = r.json()
-                    return j.get("choices", [{}])[0].get("message", {}).get("content")
+                    text = j["choices"][0]["message"]["content"].strip()
+                    return text
                 else:
-                    logger.warning(f"LLM call failed {r.status_code}: {r.text}")
+                    logger.error("OpenAI error: %s", r.text)
         except Exception as e:
-            logger.error(f"LLM call exception: {e}")
-        time.sleep(1)
-    return None
+            logger.error("OpenAI exception: %s", e)
+        return raw_prompt
 
-# ---------- response builder ----------
-def format_price_reply(name: str, price: Optional[str], unit: Optional[str]) -> str:
-    # Arabic concise reply with emojis
-    emoji_price = "💰"
-    emoji_unit = "📦"
-    emoji_ask = "✍️"
-    if price:
-        unit_display = unit if unit else "Unit"
-        return f"✅ *{name}*\n{emoji_price} السعر: {price} جنيه\n{emoji_unit} الوحدة: {unit_display}\n\n{emoji_ask} لو تحب تطلب اكتب \"طلب\" أو اكتب الكمية."
-    else:
-        # price unknown: show menu + fallback message
-        return (
-            f"📋 *{name}*\n"
-            f"💰 السعر: غير متاح حالياً\n"
-            f"📦 الوحدة: غير متاح\n\n"
-            f"❗ ممكن تشوف المنيو الكامل هنا:\n{MENU_TEXT}\n"
-            f"📩 سيتم التواصل معك في أقرب وقت."
-        )
+    # Groq أو مزوّد آخر يمكن إضافته هنا (استخدم GROQ_API_KEY)
+    # وإلا نعيد raw prompt
+    return raw_prompt
 
-def unknown_product_reply():
-    # when bot doesn't know, send full menu links and friendly text
-    return (
-        f"معلش مش لاقي المنتج ده عندي بشكل مباشر 😕\n\n"
-        f"{MENU_TEXT}\n"
-        f"✳️ لو محتاج سعر صنف معين اكتب اسمه بالضبط أو أقرب شكل ليه.\n"
-        f"📩 هيتم التواصل معك لو محتاجين توضيح."
-    )
+# ----- معالجة أوامر STOP و resume -----
+STOP_WORDS = {"stop", "سكت", "وقف", "بطل", "كفاية", "وقف الكلام"}
+RESUME_WORDS = {"start", "ابدأ", "رجع", "كمل", "resume", "استأنف"}
 
-# ---------- main generate reply ----------
-async def generate_reply(user_msg: str, user_id: Optional[str] = None) -> str:
-    """
-    Main logic:
-    - handle user commands: stop, resume
-    - search data.txt for product
-    - if exact/close match found: return price reply
-    - else: return menu links + will contact
-    """
-    text = user_msg.strip()
-    if not text:
-        return "لو سمحت اكتب سؤالك 😊"
+def is_stop_command(text: str) -> bool:
+    t = text.strip().lower()
+    return any(t == w or t.startswith(w + " ") for w in STOP_WORDS)
 
-    # commands (in Arabic + English)
-    cmd_stop = ["stop", "توقف", "سكت", "اوقف", "وقف", "pause"]
-    cmd_resume = ["resume", "ابدأ", "استمر", "تابع", "resume", "استئنف", "كمل"]
+def is_resume_command(text: str) -> bool:
+    t = text.strip().lower()
+    return any(t == w or t.startswith(w + " ") for w in RESUME_WORDS)
 
-    lower = text.lower()
-    # stop command
-    if any(lower == c or lower.startswith(c + " ") for c in cmd_stop):
-        if user_id:
-            PAUSED[str(user_id)] = {"paused": True, "since": int(time.time())}
-            save_paused(PAUSED)
-            logger.info(f"Paused user {user_id}")
-        return "🛑 تم إيقاف الردود عليك مؤقتًا. اكتب `resume` أو `استمر` لما تحب أرجع أتكلم معاك."
-
-    if any(lower == c or lower.startswith(c + " ") for c in cmd_resume):
-        if user_id and str(user_id) in PAUSED:
-            PAUSED.pop(str(user_id), None)
-            save_paused(PAUSED)
-            logger.info(f"Resumed user {user_id}")
-        return "✅ تم استئناف الردود. أنا جاهز تاني ✨"
-
-    # if user paused, return nothing (or an acknowledgement)
-    if user_id and str(user_id) in PAUSED:
-        return "🛑 البوت في وضع سكون عندك — اكتب `resume` لو حابب أرجع أتعامل مع رسائل حضرتك."
-
-    # load data
-    data_text = safe_read(DATA_FILE)
-    if not data_text:
-        # fallback: send menu links
-        return (
-            "المعذرة — ملف الأسعار غير موجود حالياً عندي.\n\n"
-            f"{MENU_TEXT}\n"
-            "📩 سيتم التواصل معك في أقرب وقت."
-        )
-
-    lines, products = build_search_index(data_text)
-
-    # first try: explicit price pattern like "اسم: 130 — KG" or "اسم: 130 — Unit"
-    # quick direct search: look for exact substring
-    q = text.strip()
-    # normalize spaces
-    q_norm = re.sub(r"\s+", " ", q)
-    # try to find any product line containing q_norm
-    found = None
-    for i, line in enumerate(lines):
-        if q_norm.lower() in line.lower():
-            # parse price near this line
-            price, unit = parse_price_from_lines(lines, i)
-            # derive product name from line before the price digit
-            # fallback product name = the line or nearest preceding short text line
-            name = line
-            found = (name, price, unit)
-            break
-
-    # if not found, try fuzzy match against products list
-    if not found:
-        matches = find_best_match(q, products, n=5)
-        if matches:
-            # pick best (first)
-            name, idx, raw = matches[0]
-            price, unit = parse_price_from_lines(lines, idx)
-            found = (name, price, unit)
-            # if price missing, try further lines around idx
-            if not price:
-                price, unit = parse_price_from_lines(lines, max(0, idx-1))
-                found = (name, price, unit)
-
-    # if still not found: build suggestion list of close matches to propose
-    if not found:
-        # prepare suggestions (top 3 fuzzy matches)
-        names_only = [p[0] for p in products]
-        close = get_close_matches(q_norm.lower(), [n.lower() for n in names_only], n=3, cutoff=0.55)
-        suggestion_lines = ""
-        if close:
-            suggestion_lines = "🔎 ممكن تقصِد:\n" + "\n".join(f"- {s}" for s in close) + "\n\n"
-        # return menu + suggestions
-        return suggestion_lines + unknown_product_reply()
-
-    # format reply
-    name, price, unit = found
-    # make name friendly
-    name_display = name.split("  ")[0].strip()
-    reply = format_price_reply(name_display, price, unit)
-    return reply
-
-# ---------- send message ----------
+# ----- إرسال رسالة لفيسبوك -----
 def send_message(user_id: str, text: str):
+    if not PAGE_TOKEN:
+        logger.warning("PAGE_TOKEN not set — cannot send message.")
+        return
+    url = "https://graph.facebook.com/v19.0/me/messages"
+    params = {"access_token": PAGE_TOKEN}
+    payload = {"recipient": {"id": user_id}, "message": {"text": text}}
     try:
-        if not PAGE_TOKEN:
-            logger.warning("PAGE_TOKEN not set — skipping sending message")
-            return
-        url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
-        payload = {
-            "recipient": {"id": user_id},
-            "message": {"text": text}
-        }
-        r = requests.post(url, json=payload, timeout=10)
-        logger.info(f"📤 Sent (to {user_id}): {text[:60]} | Status: {r.status_code}")
-        if r.status_code != 200:
-            logger.warning(f"Send message response: {r.status_code} {r.text}")
+        r = requests.post(url, params=params, json=payload, timeout=10)
+        logger.info("📤 Sent to %s | status: %s", user_id, r.status_code)
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error("Error sending to FB: %s", e)
 
-# ---------- FastAPI app ----------
-app = FastAPI()
+# ----- المنطق الرئيسي للرد -----
+async def handle_user_message(user_id: str, text: str) -> str:
+    # حالة STOP
+    if is_stop_command(text):
+        paused_users[user_id] = time.time()
+        save_paused(paused_users)
+        return "⏸️ موافق — هاسكت. لما تحب نكمل اكتب: start أو ابدأ."
 
-@app.get("/")
-def home():
-    return {"status": "alive", "note": "FinalBot active"}
+    if is_resume_command(text):
+        if user_id in paused_users:
+            paused_users.pop(user_id, None)
+            save_paused(paused_users)
+            return "▶️ تمام — حاضر، نكمل."
+        else:
+            return "🙂 البوت شغال بالفعل. كيف أقدر أخدمك؟"
 
+    # لو المستخدم موقوف (سبق وطلب STOP) — لا نرد إلا resume
+    if user_id in paused_users:
+        return "⏸️ أنت طلبت البوت يتوقف — اكتب 'start' أو 'ابدأ' لو عايز ترجع الردود."
+
+    # تنظيف الطلب
+    q = text.strip()
+
+    # استعلام مباشر (مطابقة بسيطة)
+    direct = search_in_data(q)
+    if direct:
+        # لو لقاها بالاسم بالضبط أو داخل الاسم
+        # نرد بأول نتيجة واضحة
+        cat, name, info = direct[0]
+        resp = format_item_response(cat, name, info)
+        # نقترح روابط المنيو لو حابب
+        resp += "\n\n📋 للمنيو الكامل: " + "https://misrsweets.com/catalogs/\n😊 لو عايز أضيف سعر جديد تأكد بكتابة: تأكيد سعر <اسم الصنف> — وسأحفظه."
+        return await ai_refine_reply(resp)
+
+    # لو مفيش نتيجة مباشرة -> نحاول المطابقة التقريبية
+    match_name, score, cat = find_best_match(q)
+    logger.info("Best match: %s (score=%s) in %s", match_name, score, cat)
+    if score >= SIMILARITY_THRESHOLD:
+        info = data_index.get(cat, {}).get(match_name)
+        resp = format_item_response(cat, match_name, info)
+        # إذا المطابقة منخفضة لكن مقبولة نعرض "تقصد؟"
+        if score < 0.9:
+            resp += f"\n\nهل تقصد: «{match_name}»؟ لو لا اكتب الاسم تاني أو اكتب 'منيو' عشان أبعتهولك."
+        resp += "\n\n📋 المنيو الكامل: https://misrsweets.com/catalogs/"
+        return await ai_refine_reply(resp)
+
+    # لو لم يجد أي مطابقة جيدة -> نعرض المنيو الكامل أولاً (طلبك)
+    # ثم نقول سنتواصل معك
+    resp = "أنا مبعتلك المنيو دلوقتي عشان تختار 🔽\n\n" + MENU_LINKS_TEXT + "\n\n📩 سيتم التواصل معك في أقرب وقت لو احتجنا توضيح. لو عايز سعر صنف معين اكتب اسمه تقريبًا."
+    return resp
+
+# ----- endpoint التحقق (Facebook webhook verify) -----
 @app.get("/webhook")
-def verify(request: Request):
+def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
-    if mode == "subscribe" and token and challenge and token == VERIFY_TOKEN:
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logger.info("Webhook verified successfully.")
         return int(challenge)
-    # friendly message for health checks
-    return JSONResponse({"status": "webhook endpoint active"}, status_code=200)
+    logger.warning("Webhook verification failed.")
+    raise HTTPException(status_code=403, detail="Verification failed")
 
+# ----- endpoint استقبال الرسائل -----
 @app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    logger.info(f"📩 Incoming Event: {body}")
-
-    # typical Facebook page webhook structure
+async def fb_webhook(request: Request):
+    body = await request.json()
+    logger.info("📩 Incoming Event: %s", body)
+    # عملية بسيطة للتعامل مع page messages
     if body.get("object") == "page":
         for entry in body.get("entry", []):
-            for messaging in entry.get("messaging", []):
-                sender = messaging.get("sender", {}).get("id")
-                # ignore delivery/read events
-                if "message" in messaging and isinstance(messaging["message"], dict):
-                    text = messaging["message"].get("text") or ""
-                    if not text:
-                        # ignore attachments for now
-                        continue
-                    # generate reply
-                    try:
-                        reply = await generate_reply(text, user_id=sender)
-                    except Exception as e:
-                        logger.error(f"Error generating reply: {e}")
-                        reply = "عذرًا فيه مشكلة دلوقتي في النظام. حاول تاني بعد شويّة."
-                    # if reply not empty and user not paused send
-                    if reply:
-                        send_message(sender, reply)
-        return JSONResponse({"status": "ok"}, status_code=200)
-    return JSONResponse({"status": "ignored"}, status_code=200)
+            for event in entry.get("messaging", []):
+                # بعض الاحداث delivery أو read
+                if "message" in event:
+                    sender_id = str(event["sender"]["id"])
+                    # لو الرسالة نصية
+                    if "text" in event["message"]:
+                        text = event["message"]["text"]
+                        logger.info("👤 User %s says: %s", sender_id, text)
+                        reply_text = await handle_user_message(sender_id, text)
+                        send_message(sender_id, reply_text)
+                    else:
+                        # رد افتراضي على attachments
+                        send_message(sender_id, "🙏 استلمت رسالتك، لو حبّيت اكتب اسم المنتج اللي محتاجه أو 'منيو' لأبعتلك القوائم.")
+        return JSONResponse({"status": "EVENT_RECEIVED"}, status_code=200)
+    return JSONResponse({"status": "IGNORED"}, status_code=200)
 
-# ---------- CLI helper to add memory entry (not automatic training) ----------
-def add_memory_entry(entry_type: str, content: str):
-    # basic memory append following user's MEMORY_RULES format
-    safe = f"{time.strftime('%Y-%m-%d')} — {entry_type} — {content}"
-    try:
-        with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-            f.write(safe + "\n")
-        logger.info(f"Memory appended: {safe}")
-    except Exception as e:
-        logger.error(f"Failed to append memory: {e}")
+# ----- أدوات مساعدة لإضافة سعر جديد للذاكرة (تأكد قبل الاضافة) -----
+def confirm_and_store_price(item_name: str, price: str, unit: str = ""):
+    # هذه الدالة تُكتب في حالة تأكيد منك يدوياً عبر واجهة/أمر
+    # تضيف سطر في memory.txt ولمساته تحتاج تحقق بشري لاحقاً
+    now = time.strftime("%Y-%m-%d")
+    line = f"{now} — PRICE_UPDATE — \"{item_name}\" — {price} — {unit}"
+    append_memory(line)
+    logger.info("Memory appended: %s", line)
+    return line
 
-# ---------- run in uvicorn if executed directly ----------
+# ----- نقطة بداية التشغيل -----
 if __name__ == "__main__":
-    # quick check: ensure data file exists (but don't crash)
-    if not os.path.exists(DATA_FILE):
-        logger.warning(f"{DATA_FILE} not found. Create it with product: price — UNIT lines for best results.")
-    # ensure paused file exists
-    if not os.path.exists(PAUSE_FILE):
-        save_paused(PAUSED)
-    import uvicorn as _uv
-    _uv.run("bot:app", host="0.0.0.0", port=PORT)
+    port = int(os.getenv("PORT", 8080))
+    logger.info("Starting server on port %s", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
