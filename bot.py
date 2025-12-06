@@ -6,7 +6,7 @@ import time
 import re
 from pathlib import Path
 from difflib import get_close_matches
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import requests
 import httpx
@@ -15,22 +15,22 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import uvicorn
 
-# ---------- إعدادات لوجنج ----------
+# ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("bot")
-logger.info("🚀 BOT RUNNING WITH ChatGPT BACKEND (Local-first with optional OpenAI)")
+logger.info("🚀 BOT STARTING — Local-first product lookup (Arabic replies, minimal emojis)")
 
-# ---------- تحميل متغيرات البيئة ----------
+# ---------- env ----------
 load_dotenv()
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN", "")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # optional: لو مش موجود، يستخدم الردود المحلية
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)  # optional
 
-# ---------- ملفات البيانات ----------
+# ---------- files ----------
 DATA_FILE = Path("data.txt")
 MEMORY_FILE = Path("memory.json")
 
-# روابط المنيو (لو تحب تعدلها في data.txt ممكن، لكن هنا كـ fallback)
+# ---------- default menu links (fallback) ----------
 MENU_LINKS = [
     "منيو الحلويات المصرية: https://photos.app.goo.gl/g9TAxC6JVSDzgiJz5",
     "منيو الحلويات الشرقية: https://photos.app.goo.gl/vjpdMm5fWB2uEJLR8",
@@ -42,197 +42,174 @@ MENU_LINKS = [
     "جميع الكتالوجات: https://misrsweets.com/catalogs/"
 ]
 
-# ---------- مساعدة: قراءة وتهيئة الذاكرة ----------
+# ---------- memory helpers ----------
 def ensure_memory() -> Dict:
     if not MEMORY_FILE.exists():
-        logger.info("إنشاء ملف memory.json جديد")
-        empty = {"paused_users": {}, "unknown_queries": []}
-        MEMORY_FILE.write_text(json.dumps(empty, ensure_ascii=False, indent=2), encoding="utf-8")
-        return empty
+        base = {"paused_users": {}, "unknown_queries": []}
+        MEMORY_FILE.write_text(json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
+        return base
     try:
         data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-        # ensure keys
         if "paused_users" not in data:
             data["paused_users"] = {}
         if "unknown_queries" not in data:
             data["unknown_queries"] = []
         return data
     except Exception as e:
-        logger.error("خطأ في قراءة memory.json، سيتم إعادة إنشاءه: %s", e)
-        empty = {"paused_users": {}, "unknown_queries": []}
-        MEMORY_FILE.write_text(json.dumps(empty, ensure_ascii=False, indent=2), encoding="utf-8")
-        return empty
+        logger.error("Error reading memory.json, recreating: %s", e)
+        base = {"paused_users": {}, "unknown_queries": []}
+        MEMORY_FILE.write_text(json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
+        return base
 
 def save_memory(mem: Dict):
     MEMORY_FILE.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
 
 memory = ensure_memory()
 
-# ---------- قراءة Data.txt وفهرستها ----------
-def parse_line_for_item(line: str) -> Optional[Tuple[str, float, str]]:
+# ---------- parse data.txt ----------
+def parse_line_for_item(line: str) -> Optional[Tuple[str, Optional[float], str]]:
     """
-    يحاول استخراج الاسم والسعر والوحدة من سطر نصي
-    تقبل صيغ مختلفة: 'اسم: 130 — KG' أو 'اسم\t...\t130.00\tKG'
+    حاول استخراج اسم/سعر/وحدة من سطر نصى.
+    يرجع (name, price_or_None, unit_str)
     """
     line = line.strip()
     if not line:
         return None
 
-    # استبعاد رؤوس أو أرقام فقط
-    if re.fullmatch(r"[\d\-\t,\. ]+", line):
-        return None
-
-    # نجرب فصل على '—' '—' '-' ':' '—' أو '—' ascii em dash
-    # نبحث عن آخر رقم في السطر كالسعر
-    # pattern بسيط للبحث عن السعر (رقم يحتوي على فاصلة عشرية اختيارية)
-    price_match = re.search(r"(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:$|\b)", line)
+    # استخرج السعر: رقم قد يحتوي على فاصلة أو نقطة (نبحث عن آخر رقم)
+    price_match = re.search(r"(\d{1,3}(?:[.,]\d{1,2})?)(?!.*\d)", line)
+    price = None
     if price_match:
-        price_str = price_match.group(1).replace(",", ".")
         try:
-            price = float(price_str)
+            price = float(price_match.group(1).replace(",", "."))
         except:
             price = None
-    else:
-        price = None
 
-    # الوحدة: كلمة بعد السعر أو وجود 'KG' أو 'Unit' أو 'كجم' الخ.
-    unit = None
-    unit_match = re.search(r"(KG|Unit|كجم|ك|كيلو|جم|جرام|Unit|Unit )", line, re.IGNORECASE)
+    # detect unit near price or common units
+    unit = ""
+    unit_match = re.search(r"\b(KG|كيلو|كجم|جم|جرام|Unit|unit|قطعة|Unit)\b", line, re.IGNORECASE)
     if unit_match:
-        unit = unit_match.group(1)
+        unit = unit_match.group(0)
 
-    # اسم المنتج: نأخذ بداية السطر إلى قبل السعر إن أمكن، وإزالة أكواد
-    # نحاول إزالة أرقام/كود من البداية
-    # split by common separators and pick the chunk that looks like name (non-numeric)
-    # first remove tabs and many spaces
-    parts = re.split(r"\t+|\s{2,}|\s-\s|\s—\s|:|–|-", line)
-    # keep the longest part containing letters (arabic)
-    candidate = None
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        # ignore if p is mostly digits or codes
-        if re.search(r"[A-Za-z\u0600-\u06FF]", p):  # contains arabic or letters
-            if candidate is None or len(p) > len(candidate):
-                candidate = p
-    name = candidate or line
+    # determine name: remove price and unit, remove codes (numbers at start)
+    cleaned = re.sub(r"\b\d+[\d\.\,]*\b", "", line)  # remove numbers
+    # split by tabs or multiple spaces or dashes
+    parts = [p.strip() for p in re.split(r"\t+|\s{2,}|\s-\s|\s—\s|:|\||,", cleaned) if p.strip()]
+    # choose the part with arabic letters or longest
+    name_candidates = [p for p in parts if re.search(r"[\u0600-\u06FFA-Za-z]", p)]
+    name = name_candidates[0] if name_candidates else (parts[0] if parts else line)
+    # final cleanup
+    name = name.strip(" -:؛،")
 
-    # cleanup name from price fragment if still present
-    name = re.sub(r"\d[\d\.,]*", "", name).strip(" -,:؛؛\t")
-
-    return (name, price if price is not None else None, unit or "")
+    return (name, price, unit)
 
 def load_data() -> Dict[str, Dict]:
-    """
-    يعيد dict: name -> {"price": float|None, "unit": str}
-    """
     index = {}
     if not DATA_FILE.exists():
-        logger.warning("data.txt غير موجود — الفهرس فارغ")
+        logger.warning("data.txt not found. index empty.")
         return index
-
     text = DATA_FILE.read_text(encoding="utf-8")
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
+    lines = [l for l in text.splitlines() if l.strip()]
     for line in lines:
         parsed = parse_line_for_item(line)
         if parsed:
             name, price, unit = parsed
-            key = name.strip()
-            if key:
-                # لو نفس الاسم موجود، لا تحذفه — حافظ على أول قيمة أو حدثها
-                index[key] = {"price": price, "unit": unit}
-    logger.info("تم تحميل %d صنف من data.txt", len(index))
+            if name:
+                index[name] = {"price": price, "unit": unit}
+    logger.info("Loaded %d items from data.txt", len(index))
     return index
 
 data_index = load_data()
 all_names = list(data_index.keys())
 
-# ---------- أدوات المساعدة للبحث ----------
-def find_product(name: str) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[list]]:
+# reload function to call after updating data.txt without restarting if needed
+def reload_data():
+    global data_index, all_names
+    data_index = load_data()
+    all_names = list(data_index.keys())
+
+# ---------- search helpers ----------
+def find_product(name: str) -> Tuple[Optional[str], Optional[float], Optional[str], List[str]]:
     """
-    يحاول إيجاد تطابق مباشر، أو تطابق قريب (fuzzy).
-    يعيد: match_name, price, unit, suggestions
+    يحاول إيجاد تطابق مباشر، فرعي، ثم fuzzy.
+    returns (matched_name or None, price, unit, suggestions_list)
     """
-    name = name.strip()
-    # direct exact (case-insensitive)
+    name_clean = name.strip().lower()
+    # exact match
     for k in all_names:
-        if k.strip().lower() == name.lower():
-            info = data_index.get(k)
+        if k.strip().lower() == name_clean:
+            info = data_index.get(k, {})
             return k, info.get("price"), info.get("unit"), []
 
-    # substring match (contains)
-    substr_matches = [k for k in all_names if name.lower() in k.lower()]
-    if substr_matches:
-        chosen = substr_matches[0]
-        info = data_index.get(chosen)
-        suggestions = substr_matches[:5]
-        return chosen, info.get("price"), info.get("unit"), suggestions
+    # substring matches
+    substr = [k for k in all_names if name_clean in k.lower()]
+    if substr:
+        k = substr[0]
+        info = data_index.get(k, {})
+        return k, info.get("price"), info.get("unit"), substr[:6]
 
     # fuzzy using difflib
-    close = get_close_matches(name, all_names, n=5, cutoff=0.6)
+    close = get_close_matches(name, all_names, n=6, cutoff=0.6)
     if close:
-        chosen = close[0]
-        info = data_index.get(chosen)
-        return chosen, info.get("price"), info.get("unit"), close
+        k = close[0]
+        info = data_index.get(k, {})
+        return k, info.get("price"), info.get("unit"), close
 
-    # no match
     return None, None, None, []
 
-# ---------- توليد الرد المحلي (بدون AI خارجي) ----------
+# ---------- formatting replies ----------
 def format_price_reply(name: str, price: Optional[float], unit: Optional[str]) -> str:
     if price is None:
-        # رسالة افتراضية عند عدم توفر السعر
+        # name exists but price missing
         menu_text = "\n".join(MENU_LINKS)
         return (
-            f"🧾 **{name}**\n"
-            f"💰 السعر: غير متاح\n"
-            f"📦 الوحدة: غير متاح\n\n"
-            f"❗ المنتج اللي بتدور عليه غير موجود بالسعر عندنا دلوقتي.\n"
-            f"📋 تقدر تشوف المنيو الكامل هنا:\n{menu_text}\n\n"
-            "📩 سيتم التواصل معك في أقرب وقت للتأكيد. 😊"
+            f"📋 المنيو الكامل:\n{menu_text}\n\n"
+            f"✳️ بالنسبة لـ «{name}» السعر غير مضاف حالياً.\n"
+            f"📩 سيتم التواصل معك قريبًا للتأكيد."
         )
+    # format price nicely
+    if price == int(price):
+        price_str = f"{int(price)}"
     else:
-        # price present
-        # format price (no trailing .0)
-        price_str = str(int(price)) if price == int(price) else f"{price:.2f}"
-        unit_str = unit or "وحدة"
-        return f"✅ **{name}**\n💰 السعر: {price_str} ج\n📦 الوحدة: {unit_str}\nلو حابب أضيفه للطلب اكتب: طلب {name} ✅"
+        price_str = f"{price:.2f}"
+    unit_str = unit or "وحدة"
+    return f"✅ {name}\n💰 السعر: {price_str} ج\n📦 الوحدة: {unit_str}\nلو تحب تضيفه للطلب اكتب: طلب {name} ✅"
 
-# ---------- استدعاء ChatGPT (اختياري) ----------
+def menu_reply_short() -> str:
+    # Short menu header with minimal emojis (as requested)
+    menu_text = "\n".join(MENU_LINKS)
+    return f"📋 تقدر تشوف المنيو هنا:\n{menu_text}\n\n✳️ لو محتاج سعر صنف معين اكتب اسمه بالضبط أو أقرب شكل ليه.\n📩 سيتم التواصل معك لو احتجنا توضيح."
+
+# ---------- OpenAI optional ----------
 async def call_openai_chat(prompt: str) -> Optional[str]:
     if not OPENAI_API_KEY:
         return None
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "gpt-4o-mini",  # اختياري: تقدر تغيره للموديل اللي عندك صلاحية له
-        "messages": [{"role": "system", "content": "أنت مساعد خدمة عملاء عربي مصري."},
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "system", "content": "أنت مساعد خدمة عملاء عربي مصري مختصر."},
                      {"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 400,
+        "max_tokens": 300,
     }
-    # طلب مع retry بسيط
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=12) as client:
                 r = await client.post(url, json=payload, headers=headers)
             if r.status_code == 200:
-                data = r.json()
-                txt = data["choices"][0]["message"]["content"].strip()
-                return txt
+                return r.json()["choices"][0]["message"]["content"].strip()
             else:
-                logger.error("OpenAI returned %s: %s", r.status_code, r.text)
+                logger.warning("OpenAI returned %s: %s", r.status_code, r.text)
         except Exception as e:
-            logger.error("OpenAI call error attempt %d: %s", attempt + 1, e)
+            logger.error("OpenAI call error: %s", e)
         time.sleep(1)
     return None
 
-# ---------- أذونات التشغيل (pause / resume) ----------
+# ---------- pause / memory ----------
 def is_paused(user_id: str) -> bool:
     mem = ensure_memory()
-    return mem.get("paused_users", {}).get(str(user_id), False)
+    return bool(mem.get("paused_users", {}).get(str(user_id), False))
 
 def set_paused(user_id: str, value: bool):
     mem = ensure_memory()
@@ -244,126 +221,101 @@ def log_unknown_query(user_id: str, text: str):
     mem.setdefault("unknown_queries", []).append({"user": str(user_id), "text": text, "ts": int(time.time())})
     save_memory(mem)
 
-# ---------- وظيفة توليد الرد النهائي (المنطق الرئيسي) ----------
+# ---------- main reply generator ----------
 async def generate_reply(user_id: str, user_msg: str) -> str:
-    # تنظيف الرسالة
     msg = user_msg.strip()
+    if not msg:
+        return menu_reply_short()
 
-    # أوامر تحكم سريعة
-    cmd_stop = ["stop", "قف", "وقف", "stopً", " توقف"]
-    cmd_start = ["start", "ابدأ", "استأنف", "استئناف", "resume"]
-
-    low = msg.lower()
-    if any(low == c for c in cmd_stop):
+    # control commands
+    stop_cmds = ["stop", "قف", "وقف", "توقف"]
+    start_cmds = ["start", "ابدأ", "استأنف", "استئناف"]
+    low = msg.lower().strip()
+    if low in stop_cmds:
         set_paused(user_id, True)
-        return "⛔ تم إيقاف الردود مؤقتًا. اكتب 'ابدأ' أو 'start' عشان يرجع يرد تاني."
-
-    if any(low == c for c in cmd_start):
+        return "⛔ تم إيقاف الردود عندك. اكتب 'ابدأ' لو عايز البوت يشتغل تاني."
+    if low in start_cmds:
         set_paused(user_id, False)
-        return "✅ جاهز تاني! أنا رجعت وباقي أساعدك 👋"
+        return "✅ رجعت تاني! جاهز أساعدك."
 
-    # لو المستخدم متوقف (pause)، لا نرد بمحتوى عادي
     if is_paused(user_id):
-        return "🔕 البوت متوقف مؤقتاً عندك. لو عايز رجوع اكتب 'ابدأ'."
+        return "🔕 البوت متوقف عندك. اكتب 'ابدأ' لو حابب ترجعه."
 
-    # لو الرسالة طلب القوائم أو كلمة "المنيو" أو "منيو" إلخ -> نعرض الروابط مباشرة
-    if re.search(r"\b(المنيو|منيو|قائمة|قائمة|menu)\b", msg, re.IGNORECASE):
-        menu_text = "\n".join(MENU_LINKS)
-        return f"📋 تقدر تشوف المنيو الكامل هنا:\n{menu_text}\n\nلو حبيت أعرف سعر منتج معين اكتب اسمه وانا أقولك السعر."
+    # direct requests for menu / list
+    if re.search(r"\b(المنيو|منيو|قائمة|قائمة|menu|أسعار)\b", msg, re.IGNORECASE):
+        return menu_reply_short()
 
-    # لو الرسالة تطلب "مواعيد" أو "فروع" -> نرد برد جاهز (تقدر تعدّل المحتوى ده في data.txt أو هنا)
-    if re.search(r"\b(مواعيد|ساعات|فروع|فرع|تليفون|رقم)\b", msg, re.IGNORECASE):
+    # request for branches/times
+    if re.search(r"\b(فروع|فرع|مواعيد|ساعات|توصيل|delivery|رقم)\b", msg, re.IGNORECASE):
         return (
-            "🕒 **مواعيد العمل**\n"
-            "جميع الأيام: من 8 صباحًا إلى 10 مساءً\n"
-            "الخميس والجمعة: حتى 11 مساءً\n\n"
-            "🏬 **فروع**\n"
-            "طنطا - ميدان الساعة: 0403335941 / 0403335942\n"
-            "الإسكندرية - محطة الرمل: 034858600 / 034858700\n\n"
-            "لو عايز منيو أو سعر صنف اكتب اسم المنتج."
+            "🕒 **مواعيد العمل**: جميع الأيام من 8 ص إلى 10 م (الخميس والجمعة حتى 11 م).\n"
+            "🏬 **فروع**: طنطا - ميدان الساعة: 0403335941 / 0403335942\n"
+            "الإسكندرية - محطة الرمل: 034858600 / 034858700\n"
+            "📩 لو عايز المنيو أو سعر صنف اكتب اسمه."
         )
 
-    # نجرّب البحث في ال Data
+    # search products
     match_name, price, unit, suggestions = find_product(msg)
+
     if match_name:
-        # لو فيه سعر نرد بالسعر مباشرة
+        # if price present -> normal reply
         if price is not None:
-            reply = format_price_reply(match_name, price, unit)
-            return reply
+            return format_price_reply(match_name, price, unit)
         else:
-            # لو الاسم موجود لكن السعر مفقود
-            # نقترح المنيو ونسجل الاستفسار كـ unknown
+            # name known but price missing
             log_unknown_query(user_id, msg)
-            menu_text = "\n".join(MENU_LINKS)
-            return (
-                f"🧾 **{match_name}**\n"
-                "💰 السعر: غير متاح حالياً\n\n"
-                f"📋 المنيو الكامل هنا:\n{menu_text}\n\n"
-                "📩 سيتم التواصل معك للتأكيد في أقرب وقت."
-            )
+            return format_price_reply(match_name, None, unit)
 
-    # لو فيه اقتراحات (matches) — نعرض اقتراحات
+    # if we have suggestions (from find_product) return them as short list
     if suggestions:
-        sug_text = "\n".join(f"- {s}" for s in suggestions)
-        return (
-            "🔎 ممكن تقصد أحد المنتجات دي؟\n"
-            f"{sug_text}\n\n"
-            "لو لا، ابعتلي الاسم تاني أو اكتب 'المنيو' عشان أعرض لك القائمة كاملة."
-        )
+        sug_lines = "\n".join(f"- {s}" for s in suggestions)
+        return f"🔎 ممكن تقصد واحد من دول؟\n{sug_lines}\n\nلو لا، ابعتلي اسم المنتج تاني أو اكتب 'المنيو' عشان أعرض القوائم."
 
-    # لو مالوش أي تطابق — نسجل ونعرض المنيو + نعرض خيار تواصل لاحق
+    # no match at all => start by showing menu (as requested), do not start with 'المنتج...غير متاح'
     log_unknown_query(user_id, msg)
-    menu_text = "\n".join(MENU_LINKS)
-
-    # احاول استدعاء OpenAI لو موجود API_KEY لصياغة رد أذكى (مثلاً لتصحيح خطأ إملائي أو تقديم اقتراح)
+    # Try to use OpenAI to produce a nicer suggestion/correction if API key exists
     if OPENAI_API_KEY:
         prompt = (
-            "أنت بوت خدمة عملاء لمطعم حلويات. عندنا المعلومات التالية (أسماء منتجات وأسعار) - "
-            "أجب بالعربية بطلاقة واقترح أقرب منتجات ممكن العميل يقصدها إذا سأل بشيء غير واضح.\n\n"
-            f"DATA_KEYS: {', '.join(all_names[:60])}...\n\n"  # لا نضيف كل الأسماء الكبيرة لتقليل الطول
+            "أنت بوت خدمة عملاء لمطعم حلويات. عندنا قائمة منتجات وأسعار (موجودة محليًا).\n"
             f"رسالة العميل: {msg}\n\n"
-            "رد باقتراحات قصيرة وفصيحة وبلهجة مصرية. لو مش عارف قل: 'المعلومة دي مش موجودة عندي حالياً.' "
-            "وفي حالة عدم المعرفة، أعرض روابط المنيو التالية ثم قل 'سيتم التواصل معك في أقرب وقت.'"
+            "اقترح اختصارًا بسيطًا بالعربية لماذا لم نجد المنتج (مثلاً خطأ إملائي أو اسم مختلف) واقترح أقرب اسماء أو اطلب منه يكتب الاسم بالضبط. "
+            "رد مختصر وبلهجة مصرية."
         )
         ai_resp = await call_openai_chat(prompt)
         if ai_resp:
-            # نلحق الروابط في النهاية لضمان ظهورها
-            return ai_resp + "\n\n📋 المنيو الكامل هنا:\n" + menu_text + "\n\n📩 سيتم التواصل معك في أقرب وقت."
-        else:
-            # لو فشل OpenAI، نرجع الرد المحلي
-            return (
-                "❗ المنتج اللي بتدور عليه غير موجود بالقائمة الحالية.\n\n"
-                f"📋 تقدر تشوف المنيو الكامل هنا:\n{menu_text}\n\n📩 سيتم التواصل معك في أقرب وقت."
-            )
+            return ai_resp.strip() + "\n\n" + menu_reply_short()
 
-    # لو مفيش OpenAI نرد فوراً بالمنيو
-    return (
-        "❗ المنتج اللي بتدور عليه غير موجود بالقائمة الحالية.\n\n"
-        f"📋 تقدر تشوف المنيو الكامل هنا:\n{menu_text}\n\n📩 سيتم التواصل معك في أقرب وقت."
-    )
+    # fallback simple reply (menu first)
+    return menu_reply_short()
 
-# ---------- إرسال رسالة للفيسبوك ----------
+# ---------- send message ----------
 def send_message(user_id: str, text: str):
     if not PAGE_TOKEN:
-        logger.error("PAGE_TOKEN غير مضبوط — لا يمكن إرسال رسالة.")
+        logger.error("PAGE_TOKEN not set. Cannot send message.")
         return
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
     payload = {"recipient": {"id": user_id}, "message": {"text": text}}
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code not in (200, 201):
-            logger.error("فشل إرسال الرسالة: %s %s", r.status_code, r.text)
+            logger.error("Failed to send message: %s %s", r.status_code, r.text)
         else:
             logger.info("📤 Sent to %s | Status: %s", user_id, r.status_code)
     except Exception as e:
-        logger.exception("خطأ عند إرسال رسالة: %s", e)
+        logger.exception("Error sending message: %s", e)
 
-# ---------- FASTAPI endpoints ----------
+# ---------- FastAPI ----------
 app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"status": "alive", "mode": "local-first", "openai": bool(OPENAI_API_KEY)}
+    return {"status": "alive", "mode": "local-first", "openai_enabled": bool(OPENAI_API_KEY)}
+
+@app.get("/reload-data")
+def http_reload_data():
+    # endpoint to trigger reload after you update data.txt
+    reload_data()
+    return {"status": "reloaded", "items": len(all_names)}
 
 @app.get("/webhook")
 def verify(request: Request):
@@ -372,7 +324,7 @@ def verify(request: Request):
     challenge = request.query_params.get("hub.challenge")
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return int(challenge)
-    raise HTTPException(status_code=403, detail="Verification token mismatch")
+    raise HTTPException(status_code=403, detail="Verification failed")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -382,17 +334,19 @@ async def webhook(request: Request):
         for entry in body.get("entry", []):
             for msg in entry.get("messaging", []):
                 sender = msg.get("sender", {}).get("id")
-                # Handle text message
+                if not sender:
+                    continue
                 if "message" in msg and "text" in msg["message"]:
                     text = msg["message"]["text"]
                     logger.info("👤 User %s says: %s", sender, text)
                     reply = await generate_reply(sender, text)
                     send_message(sender, reply)
-                # optionally handle postback, attachments, etc.
+                # handle postbacks or attachments if needed
         return JSONResponse({"status": "ok"}, status_code=200)
     return JSONResponse({"status": "ignored"}, status_code=200)
 
-# ---------- تشغيل محلي ----------
+# ---------- run ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
+    reload_data()
     uvicorn.run(app, host="0.0.0.0", port=port)
