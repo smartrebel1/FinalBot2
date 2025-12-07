@@ -1,402 +1,154 @@
-# bot.py
-# نسخة كاملة ومحدثة لبوت فيسبوك — ذكي في البحث داخل data/raw_data.json
-# ميزات:
-# - يقرأ data/raw_data.json المنظم (raw JSON كبير)
-# - تطابق ذكي للمنتجات (normalization + fuzzy matching)
-# - اقتراح المنيو وروابطه لو المنتج غير معروف
-# - أوامر تحكم: stop (يقف الرد على المستخدم حتى يرسل start)
-# - يحتفظ بحالة "موقوف" لكل مستخدم في paused_users.json
-# - سجل الميموري (memory.txt) لتخزين تحديثات أسعار/FAQs (حسب قواعد الذاكرة)
-# - خيار استخدام مزود AI خارجي (OPENAI_API_KEY أو GROQ_API_KEY) لصياغة رد أذكى
-# متطلبات: fastapi, uvicorn, requests, httpx, python-dotenv, Unidecode (موصى به)
-# استخدم: uvicorn bot:app --host 0.0.0.0 --port $PORT
-
 import os
-import json
-import re
-import time
 import logging
-from difflib import get_close_matches
-from datetime import datetime
-from typing import Optional
-
 import requests
-import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+import httpx
+import uvicorn
+import time
 
-# ----- إعدادات اللوقينج -----
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
+# إعداد السجلات
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-# عرض رسالة تشغيل مع اسم الموديل (قابل للتعديل عبر env)
+# تحميل المفاتيح
 load_dotenv()
-MODEL = os.getenv("MODEL", "local-rules-first")
-logger.info(f"🚀 BOT RUNNING WITH MODEL: {MODEL}")
 
-# ----- إعدادات فيسبوك ومفاتيح (env) -----
-VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN", "verify_token_here")
-PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# إعدادات الموديل والمفاتيح
+VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
+PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ----- مسارات الملفات -----
-RAW_JSON_PATH = os.getenv("RAW_JSON_PATH", "data/raw_data.json")
-PAUSED_PATH = os.getenv("PAUSED_PATH", "data/paused_users.json")
-MEMORY_PATH = os.getenv("MEMORY_PATH", "data/memory.txt")
+# موديل سريع جداً وذكي
+MODEL = "llama-3.3-70b-versatile"
 
-# ----- تحميل Unidecode إن وُجد لتحسين التطبيع -----
-try:
-    from unidecode import unidecode
-except Exception:
-    def unidecode(x):
-        return x
+logger.info(f"🚀 BOT RUNNING WITH {MODEL}")
 
-# ----- مساعدة: قراءة JSON/raw data -----
-def safe_load_json(path: str):
-    if not os.path.exists(path):
-        logger.warning(f"⚠️ ملف البيانات غير موجود: {path}")
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-RAW = safe_load_json(RAW_JSON_PATH)
-
-# ----- بناء فهرس للبحث السريع -----
-def normalize_ar(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.strip().lower()
-    # أحرف عربية متشابهة توحيد
-    s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-    s = s.replace("ة", "ه").replace("ى", "ي")
-    # إزالة التشكيل والرموز
-    s = re.sub(r"[^\w\s\u0600-\u06FF]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return unidecode(s)
-
-# فهرس: map normalized_alias -> item
-INDEX = {}
-NAME_TO_ITEM = {}
-
-def build_index():
-    global RAW, INDEX, NAME_TO_ITEM
-    RAW = safe_load_json(RAW_JSON_PATH) or {}
-    INDEX = {}
-    NAME_TO_ITEM = {}
-    categories = RAW.get("categories", {})
-    for cat_name, items in categories.items():
-        for it in items:
-            # ensure minimal fields exist
-            name = it.get("name", "").strip()
-            code = it.get("code", "")
-            aliases = it.get("aliases") or []
-            # add name as alias
-            if name and name not in aliases:
-                aliases.append(name)
-            # generate basic fallback aliases
-            norm_aliases = set()
-            for a in aliases:
-                na = normalize_ar(a)
-                if na:
-                    norm_aliases.add(na)
-                na2 = na.replace(" ", "")
-                if na2:
-                    norm_aliases.add(na2)
-            # add also name variations
-            norm_aliases.add(normalize_ar(name))
-            # map into index
-            for na in norm_aliases:
-                INDEX[na] = it
-            # store by code/name
-            NAME_TO_ITEM[name] = it
-
-build_index()
-
-# ----- إدارة حالة pause للمستخدمين -----
-def load_paused():
-    if not os.path.exists(PAUSED_PATH):
-        return {}
-    with open(PAUSED_PATH, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except Exception:
-            return {}
-
-def save_paused(paused):
-    os.makedirs(os.path.dirname(PAUSED_PATH) or ".", exist_ok=True)
-    with open(PAUSED_PATH, "w", encoding="utf-8") as f:
-        json.dump(paused, f, ensure_ascii=False, indent=2)
-
-PAUSED = load_paused()
-
-def set_paused(user_id: str, paused: bool):
-    global PAUSED
-    if paused:
-        PAUSED[user_id] = {"paused_at": datetime.utcnow().isoformat()}
-    else:
-        if user_id in PAUSED:
-            PAUSED.pop(user_id)
-    save_paused(PAUSED)
-
-def is_paused(user_id: str) -> bool:
-    return str(user_id) in PAUSED
-
-# ----- إدارة الذاكرة (بسيطة) -----
-def append_memory(line: str):
-    # لا تحفظ بيانات شخصية — استعمل بحذر
-    os.makedirs(os.path.dirname(MEMORY_PATH) or ".", exist_ok=True)
-    with open(MEMORY_PATH, "a", encoding="utf-8") as f:
-        f.write(line.strip() + "\n")
-
-# ----- البحث الذكي عن العنصر -----
-def find_item_local(query: str, cutoff: float = 0.6) -> Optional[dict]:
-    qn = normalize_ar(query)
-    if not qn:
-        return None
-    # direct
-    if qn in INDEX:
-        return INDEX[qn]
-    # try close matches
-    keys = list(INDEX.keys())
-    matches = get_close_matches(qn, keys, n=5, cutoff=cutoff)
-    if matches:
-        return INDEX[matches[0]]
-    # try token-based partial match
-    tokens = qn.split()
-    for t in tokens:
-        if t in INDEX:
-            return INDEX[t]
-    return None
-
-# ----- قوالب الرد -----
-def format_item_reply(item: dict) -> str:
-    # يصيغ الرد العربي مع إيموجي
-    name = item.get("name", "المنتج")
-    price = item.get("price")
-    unit = item.get("unit") or item.get("measure") or "غير متاح"
-    code = item.get("code", "")
-    parts = []
-    parts.append(f"🧾 **{name}**")
-    if price is not None and str(price).strip() != "":
-        parts.append(f"💰 السعر: {price:.2f} جنيه")
-    else:
-        parts.append(f"💰 السعر: غير متاح")
-    parts.append(f"📦 الوحدة: {unit}")
-    if code:
-        parts.append(f"🔢 كود المنتج: {code}")
-    # قليل من النص الودي
-    parts.append("✅ لو تحب أرسلك طريقه الطلب أو أضغط على الرابط في المنيو.")
-    return "\n".join(parts)
-
-def menu_reply_links() -> str:
-    meta = RAW.get("metadata", {})
-    links = meta.get("menus_links", [])
-    lines = ["🍰 تقدر تشوف المنيو الكامل هنا:"]
-    for ln in links:
-        lines.append(ln)
-    lines.append("\n✳️ لو محتاج سعر صنف معين اكتب اسمه بالضبط أو أقرب شكل ليه.")
-    lines.append("📩 سيتم التواصل معك لو احتجنا توضيح إضافي.")
-    return "\n".join(lines)
-
-# ----- خيار استخدام AI خارجي لصياغة رد ذكي (اختياري) -----
-async def call_ai_for_polish(user_msg: str, matched_item: Optional[dict] = None) -> Optional[str]:
-    """
-    إذا كنت تريد أن تطلب من مزود خارجي صيغ ردود أفضل.
-    سيختار تلقائياً OpenAI إذا متوفر، وإلا GROQ لو مُعرف.
-    ملاحظة: وضع هذا كخيار — لن يُستخدم إن لم توجد مفاتيح.
-    """
-    # if no API keys, skip
-    if not OPENAI_API_KEY and not GROQ_API_KEY:
-        return None
-
-    # نجهز prompt بسيط
-    prompt_lines = [
-        "أنت مساعد دردشة لصفحة حلويات مصر. يجب أن ترد بالعربية وبلهجة مصرية مهذبة ومختصرة.",
-        "استخدم فقط المعلومات المتوفرة من data/raw_data.json إن وُجدت.",
-        f"رسالة العميل: {user_msg}"
-    ]
-    if matched_item:
-        prompt_lines.append("المنتج المطابق:")
-        prompt_lines.append(json.dumps({
-            "name": matched_item.get("name"),
-            "price": matched_item.get("price"),
-            "unit": matched_item.get("unit"),
-            "code": matched_item.get("code")
-        }, ensure_ascii=False))
-    prompt = "\n".join(prompt_lines)
-
-    # Use OpenAI ChatCompletions if key provided
-    if OPENAI_API_KEY:
-        try:
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-            payload = {
-                "model": "gpt-4o-mini",  # مثال — المستخدم يمكنه تغييره عبر env
-                "messages": [{"role":"system","content":"You are a helpful assistant."},
-                             {"role":"user","content":prompt}],
-                "temperature": 0.2,
-                "max_tokens": 300
-            }
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"].strip()
-                    return content
-                else:
-                    logger.error(f"OpenAI error: {resp.status_code} {resp.text}")
-        except Exception as e:
-            logger.error(f"OpenAI call failed: {e}")
-
-    # Groq (example) if provided
-    if GROQ_API_KEY:
-        try:
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-            payload = {
-                "model": os.getenv("GROQ_MODEL", "mixtral-8x7b-32768"),
-                "messages": [{"role":"user","content":prompt}],
-                "temperature": 0.2
-            }
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"].strip()
-                    return content
-                else:
-                    logger.error(f"Groq error: {resp.status_code} {resp.text}")
-        except Exception as e:
-            logger.error(f"Groq call failed: {e}")
-
-    return None
-
-# ----- FastAPI app و routes -----
 app = FastAPI()
+
+# قراءة البيانات مرة واحدة عند التشغيل لتسريع الأداء
+try:
+    with open("data.txt", "r", encoding="utf-8") as f:
+        KNOWLEDGE_BASE = f.read()
+    logger.info("✅ Data loaded successfully from data.txt")
+except Exception as e:
+    logger.error(f"⚠️ Error loading data.txt: {e}")
+    KNOWLEDGE_BASE = "عفواً، لا توجد معلومات متاحة حالياً."
 
 @app.get("/")
 def home():
     return {"status": "alive", "model": MODEL}
 
+# التحقق من فيسبوك
 @app.get("/webhook")
 def verify(request: Request):
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return int(challenge)
+
     raise HTTPException(status_code=403, detail="Forbidden")
 
-# helper: send message to Facebook
-def send_message(user_id: str, text: str):
-    if not PAGE_TOKEN:
-        logger.warning("⚠️ PAGE_TOKEN غير معرف — لن يتم ارسال الرسائل فعليًا.")
-        return None
-    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
-    payload = {"recipient": {"id": user_id}, "message": {"text": text}}
-    try:
-        r = requests.post(url, json=payload, timeout=8)
-        logger.info(f"📤 Sent to {user_id}: {text[:80]} | Status: {r.status_code}")
-        return r.status_code
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-        return None
+# دالة الذكاء الاصطناعي (Groq)
+async def generate_reply(user_msg: str):
+    # تجهيز البرومبت (تعليمات البوت)
+    system_prompt = f"""
+أنت مساعد خدمة عملاء ذكي ومحترم لشركة "حلويات مصر" (Misr Sweets).
+مهمتك هي الرد على العملاء باللهجة المصرية الودودة بناءً *فقط* على البيانات التالية.
 
-# الرد الذكي الرئيسي
-async def generate_reply(user_id: str, user_msg: str) -> str:
-    """
-    منطق الرد:
-    1) إذا user paused -> إذا الرسالة هي 'start' أو مرادف -> resume
-       إذا الرسالة هي 'stop' أو مرادف -> pause
-    2) بحث محلي ذكي في data raw
-       - لو وجد عنصر -> رد بصيغة price/unit (format_item_reply)
-       - لو ما وجد -> أرسل روابط المنيو مع نص متابعة
-    3) إن توافر API خارجي وطلبنا تلميع الرد -> call_ai_for_polish
-    """
-    # commands (stop/start)
-    q_low = user_msg.strip().lower()
-    if q_low in ["stop", "قف", "بس", "كفى"]:
-        set_paused(user_id, True)
-        return "⛔ تم إيقاف الردود لك. اكتب `start` أو `ابدأ` علشان أكمل الرد تاني."
-    if q_low in ["start", "ابدأ", "كمل"]:
-        set_paused(user_id, False)
-        return "✅ تمام — رجعت تاني، ممكن أساعدك بإيه؟"
+=== بيانات الشركة والمنيو ===
+{KNOWLEDGE_BASE}
+=============================
 
-    # if user is paused -> ignore except start
-    if is_paused(user_id):
-        return "⛔ أنت حاليا مُوقّف. اكتب `start` أو `ابدأ` لو عايز أرجع أرد."
+تعليمات صارمة:
+1. لا تؤلف أسعاراً أو منتجات غير موجودة في البيانات.
+2. إذا سأل العميل عن "المنيو" بشكل عام، أعطه رابط "جميع الكتالوجات" أو رابط القسم الذي يسأل عنه.
+3. كن مختصراً ومفيداً، واستخدم الإيموجي (🍰، 🎂) بشكل مناسب.
+4. إذا لم تجد المعلومة، اعتذر وقل: "المعلومة دي مش عندي حالياً، ممكن تتصل بالفرع للتأكد".
+5. لطلبات الأوردر، اطلب منهم: الاسم، العنوان، ورقم الهاتف.
 
-    # 1) بحث محلي ذكي
-    item = find_item_local(user_msg, cutoff=0.6)
-    if item:
-        # لو السعر في item مختلف عن الذاكرة — إمكانية حفظ تحديث (مثال)
-        # صياغة الرد
-        local_reply = format_item_reply(item)
-        # حاول تحسين الصياغة عبر AI إن مفعل
-        ai_polished = await call_ai_for_polish(user_msg, matched_item=item)
-        if ai_polished:
-            return ai_polished
-        return local_reply
+سؤال العميل: {user_msg}
+"""
 
-    # 2) لم نجد المنتج — نعرض المنيو والروابط أولًا (وفق طلبك)
-    menu_text = menu_reply_links()
-    # نحاول اقتراح أقرب تطابقات (fuzzy) لافتراضات المستخدم
-    qn = normalize_ar(user_msg)
-    # نبحث عن أقرب مفاتيح من INDEX
-    keys = list(INDEX.keys())
-    close = get_close_matches(qn, keys, n=3, cutoff=0.5)
-    suggestion = ""
-    if close:
-        suggested_item = INDEX[close[0]]
-        suggestion = f"\n🔎 أقرب نتيجة ممكن تقصد: {suggested_item.get('name')}\nلو ده اللي تقصده اكتب اسمه بالشكل ده بالضبط."
-    reply = f"{menu_text}{suggestion}\n\n📩 سيتم التواصل معك في أقرب وقت لو احتجنا تفاصيل."
-    # سجل في الميموري أن سؤالاً متكرراً لم يجد تطابق (بصيغة عامة، بدون بيانات شخصية)
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d")
-    append_memory(f"{timestamp} — FAQ_MISS — \"عميل سأل عن: {user_msg[:120]}\"")
-    return reply
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-# webhook handler
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": system_prompt}
+        ],
+        "temperature": 0.3,  # قليل لتقليل التأليف
+        "max_tokens": 300
+    }
+
+    # محاولة الاتصال بـ Groq (مع Retry)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"].strip()
+            else:
+                logger.error(f"🔥 Groq Error ({response.status_code}): {response.text}")
+        
+        except Exception as e:
+            logger.error(f"⚠️ Connection Error Attempt {attempt+1}: {e}")
+        
+        time.sleep(1) # انتظار ثانية قبل المحاولة التالية
+
+    return "معلش في ضغط على السيرفر دلوقتي، ممكن تبعت تاني؟ ❤️"
+
+# استقبال الرسائل
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
-    logger.info(f"📩 Incoming Event: {body}")
 
     if body.get("object") == "page":
-        # iterate events
         for entry in body.get("entry", []):
-            for messaging in entry.get("messaging", []):
-                sender = messaging.get("sender", {}).get("id")
-                # message text
-                if messaging.get("message") and "text" in messaging["message"]:
-                    text = messaging["message"]["text"]
-                    logger.info(f"👤 User {sender} says: {text}")
-                    reply = await generate_reply(sender, text)
+            for msg in entry.get("messaging", []):
+                # التأكد أنها رسالة نصية وليست إشعار آخر
+                if "message" in msg and "text" in msg["message"]:
+                    sender = msg["sender"]["id"]
+                    text = msg["message"]["text"]
+                    
+                    logger.info(f"👤 User: {text}")
+
+                    # الحصول على الرد وإرساله
+                    reply = await generate_reply(text)
                     send_message(sender, reply)
-                # optionally: postbacks, attachments handling can be added here
+
         return JSONResponse({"status": "ok"}, status_code=200)
 
     return JSONResponse({"status": "ignored"}, status_code=200)
 
-# ----- أداة مساعدة: إعادة بناء الفهرس عند تحديث data/raw_data.json ----- 
-@app.post("/admin/reload-data")
-def admin_reload_data(secret: Optional[str] = None):
-    # حماية بسيطة: استخدم env ADMIN_SECRET إن رغبت
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if ADMIN_SECRET and secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    build_index()
-    return {"status": "reloaded", "items_indexed": len(INDEX)}
+# إرسال الرسالة لفيسبوك
+def send_message(user_id, text):
+    if not PAGE_TOKEN:
+        logger.error("❌ PAGE_TOKEN is missing!")
+        return
 
-# ----- نقطة صحية بسيطة -----
-@app.get("/health")
-def health():
-    return {"ok": True, "data_loaded": bool(RAW)}
+    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
+    payload = {
+        "recipient": {"id": user_id},
+        "message": {"text": text}
+    }
 
-# ----- تشغيل محلي -----
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logger.error(f"❌ Facebook Send Error: {r.text}")
+    except Exception as e:
+        logger.error(f"❌ Connection Error sending to FB: {e}")
+
+# تشغيل السيرفر
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 8080))
-    uvicorn.run("bot:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
