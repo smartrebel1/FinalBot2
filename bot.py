@@ -6,53 +6,41 @@ from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 
-# 1. إعداد السجلات لمراقبة البوت
+# إعداد السجلات
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-# 2. تحميل المتغيرات من Railway
+# المتغيرات
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# 🔥 التغيير المهم: استخدام موديل سريع جداً لتجنب التوقف
 MODEL = "llama-3.1-8b-instant"
 
 app = FastAPI()
 
-# 3. إعداد الذاكرة
-# ذاكرة المحادثة الحالية (مؤقتة)
+# ذاكرة المحادثات (تخزين آخر 5 رسائل لكل مستخدم)
 conversations = {}
-# ملف الذاكرة الدائمة (للتعليم)
 MEMORY_FILE = "memory.txt"
 
-# 4. قراءة ملف البيانات الأساسي
+# قراءة البيانات
 try:
     with open("data.txt", "r", encoding="utf-8") as f:
         BASE_KNOWLEDGE = f.read()
     logger.info("✅ Data loaded successfully")
 except Exception as e:
-    BASE_KNOWLEDGE = "لا توجد بيانات أساسية."
+    BASE_KNOWLEDGE = "لا توجد بيانات."
 
-# دالة لدمج الداتا الأصلية مع المعلومات الجديدة التي تعلمها
 def get_full_knowledge():
     memory_content = ""
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             memory_content = f.read()
-    
-    return f"""
-    {BASE_KNOWLEDGE}
-    
-    === 🧠 معلومات جديدة تم تعلمها (تحديثات) ===
-    {memory_content}
-    """
+    return f"{BASE_KNOWLEDGE}\n=== معلومات جديدة تم تعلمها ===\n{memory_content}"
 
-# دالة حفظ معلومة جديدة
 def learn_new_info(info):
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n- {info}")
-    return "تمام يا ريس، حفظت المعلومة دي في ذاكرتي! 🧠✅"
+    return "تمام، حفظت المعلومة دي في ذاكرتي! 🧠✅"
 
 @app.get("/")
 def home():
@@ -68,47 +56,38 @@ def verify(request: Request):
     raise HTTPException(status_code=403)
 
 async def generate_reply(user_id: str, user_msg: str):
-    # --- أولاً: فحص أوامر التعليم ---
+    # 1. أوامر التعليم
     if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
-        new_info = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
-        if len(new_info) > 3:
-            return learn_new_info(new_info)
-        else:
-            return "عشان اتعلم، اكتب المعلومة بعد الكلمة، مثال: اتعلم ان التوصيل مجاني."
+        return learn_new_info(user_msg.replace("اتعلم", "").replace("تعلم", "").strip())
 
-    # --- ثانياً: تجهيز الرد الذكي ---
-    
-    # استرجاع سياق المحادثة (الذاكرة القصيرة)
+    # 2. الذاكرة
     history = conversations.get(user_id, [])
     chat_context = ""
     for msg in history[-3:]: 
         chat_context += f"- {msg['role']}: {msg['content']}\n"
     
-    # قراءة كل البيانات (القديمة + الجديدة)
-    current_knowledge = get_full_knowledge()
+    full_knowledge = get_full_knowledge()
 
-    # تعليمات البوت (System Prompt)
+    # 3. تعليمات البوت الذكية
     system_prompt = f"""
-    أنت موظف مبيعات ذكي ومحترف لشركة "حلويات مصر" (Misr Sweets).
+    أنت موظف خدمة عملاء لشركة "حلويات مصر".
     
-    البيانات المتاحة (الأسعار والأنواع):
+    مرجعك الوحيد للمعلومات:
     === DATA ===
-    {current_knowledge}
+    {full_knowledge}
     ============
 
-    ⚠️ تعليمات صارمة للرد:
-    1. **اللهجة:** مصرية ودودة ومحترمة.
-    2. **البحث:** ابحث في البيانات بدقة. المعلومات في قسم "تحديثات" لها الأولوية وتلغي القديم.
-    3. **الشمول:** لو العميل سأل عن صنف عام (مثل "كنافة")، اعرض له القائمة المتاحة بأسعارها.
-    4. **عدم التوفر:** لو المنتج غير موجود أو الاسم غريب، قل:
-       "للأسف المنتج ده مش واضح عندي دلوقتي، لكن دي المنيو الكاملة 👇"
-       (وانسخ قسم روابط المنيو والكتالوجات من البيانات).
-    
-    سياق المحادثة السابقة:
+    ⚠️ قواعد الرد (صارمة جداً):
+    1. **المجاملات:** لو العميل قال (شكراً، تسلم، هاي، سلام عليكم)، رد بترحيب وذوق فوراً (مثلاً: "يا هلا بيك يا فندم 💜" أو "الشكر لله، تحت أمرك في أي وقت 💜") ولا تبحث في الأسعار.
+    2. **المنيو:** لو العميل سأل عن "المنيو" أو "القائمة"، انسخ قسم "روابط المنيو والكتالوجات" من البيانات كما هو بالضبط دون تغيير.
+    3. **التوصيل:** التزم بنص التوصيل الموجود في الداتا (طنطا غير متاح حالياً).
+    4. **الاختصار:** الإجابة تكون قصيرة ومباشرة، استخدم إيموجي (💜، 🍰).
+    5. **عدم المعرفة:** لو المعلومة مش في الداتا، قول: "للأسف المعلومة دي مش واضحة قدامي دلوقتي، ممكن تتواصل مع الفرع للتأكيد".
+
+    سياق سابق:
     {chat_context}
     
-    سؤال العميل الحالي: {user_msg}
-    الرد:
+    سؤال العميل: {user_msg}
     """
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -116,8 +95,8 @@ async def generate_reply(user_id: str, user_msg: str):
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": system_prompt}],
-        "temperature": 0.3, # درجة إبداع قليلة للالتزام بالحقائق
-        "max_tokens": 400
+        "temperature": 0.2, # تقليل الإبداع للالتزام بالنص
+        "max_tokens": 350
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
@@ -126,46 +105,32 @@ async def generate_reply(user_id: str, user_msg: str):
             if response.status_code == 200:
                 reply_text = response.json()["choices"][0]["message"]["content"].strip()
                 
-                # تحديث الذاكرة القصيرة
+                # تحديث الذاكرة
                 history.append({"role": "User", "content": user_msg})
                 history.append({"role": "Bot", "content": reply_text})
-                conversations[user_id] = history[-10:] # نحتفظ بآخر 10 رسائل
+                conversations[user_id] = history[-10:]
                 
                 return reply_text
-            elif response.status_code == 429:
-                return "معلش في ضغط كبير ع السيستم، ثواني وجرب تاني! 🙏"
             else:
-                logger.error(f"Groq Error: {response.text}")
-                return "عطل فني بسيط، جرب كمان شوية."
-        except Exception as e:
-            logger.error(f"Connection Error: {e}")
+                return "معلش ثواني وراجعلك (ضغط شبكة) 💜"
+        except:
             return "النظام مشغول حالياً."
 
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
     if body.get("object") == "page":
-        for entry in body.get("entry", []):
+        for entry in body["entry"]:
             for msg in entry.get("messaging", []):
                 if "message" in msg and "text" in msg["message"]:
                     sender = msg["sender"]["id"]
                     text = msg["message"]["text"]
-                    # الرد
                     reply = await generate_reply(sender, text)
                     send_message(sender, reply)
         return JSONResponse({"status": "ok"}, status_code=200)
     return JSONResponse({"status": "ignored"}, status_code=200)
 
 def send_message(user_id, text):
-    if not PAGE_TOKEN:
-        return
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
     payload = {"recipient": {"id": user_id}, "message": {"text": text}}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.error(f"FB Send Error: {e}")
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    requests.post(url, json=payload)
