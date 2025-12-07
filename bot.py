@@ -18,16 +18,37 @@ MODEL = "llama-3.3-70b-versatile"
 
 app = FastAPI()
 
-# ذاكرة المحادثات
-conversations = {}
+# 🧠 الذاكرة الدائمة (ملف نحفظ فيه التعليمات الجديدة)
+MEMORY_FILE = "memory.txt"
 
-# قراءة البيانات
+# قراءة البيانات الأساسية
 try:
     with open("data.txt", "r", encoding="utf-8") as f:
-        KNOWLEDGE_BASE = f.read()
-    logger.info("✅ Data loaded successfully")
-except Exception as e:
-    KNOWLEDGE_BASE = "لا توجد بيانات."
+        BASE_KNOWLEDGE = f.read()
+    logger.info("✅ Base Data loaded")
+except:
+    BASE_KNOWLEDGE = "لا توجد بيانات أساسية."
+
+# دالة قراءة الذاكرة المحدثة
+def get_updated_knowledge():
+    # نقرأ الداتا الأساسية + أي حاجة اتعلمها جديد في memory.txt
+    current_memory = ""
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            current_memory = f.read()
+    
+    return f"""
+    {BASE_KNOWLEDGE}
+    
+    === 🆕 تحديثات ومعلومات جديدة تعلمتها (لها الأولوية) ===
+    {current_memory}
+    """
+
+# دالة التعليم (تكتب في الملف)
+def learn_new_info(info):
+    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n- {info}")
+    return "تمام، حفظت المعلومة دي في ذاكرتي! 🧠✅"
 
 @app.get("/")
 def home():
@@ -43,35 +64,33 @@ def verify(request: Request):
     raise HTTPException(status_code=403)
 
 async def generate_reply(user_id: str, user_msg: str):
-    # إدارة الذاكرة
-    history = conversations.get(user_id, [])
-    chat_context = ""
-    for msg in history[-3:]: 
-        chat_context += f"- {msg['role']}: {msg['content']}\n"
+    # 🔴 1. فحص هل ده أمر تعليم؟ (للأدمن فقط)
+    # لو الرسالة بتبدأ بكلمة "اتعلم"
+    if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
+        new_info = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
+        if len(new_info) > 3:
+            return learn_new_info(new_info)
+        else:
+            return "اكتب المعلومة بعد كلمة 'اتعلم'، مثال: اتعلم ان سعر الكنافة 50"
+
+    # 🔴 2. الرد الطبيعي باستخدام البيانات المحدثة
+    full_knowledge = get_updated_knowledge()
     
-    # 🔴🔴 التعليمات المحدثة للذكاء الاصطناعي 🔴🔴
     system_prompt = f"""
-    أنت موظف مبيعات ذكي ومحترف لشركة "حلويات مصر".
+    أنت موظف مبيعات ذكي لشركة "حلويات مصر".
     
-    البيانات المتاحة:
+    مصدر معلوماتك (الأسعار والأنواع):
     === DATA ===
-    {KNOWLEDGE_BASE}
+    {full_knowledge}
     ============
 
-    ⚠️ قواعد صارمة للرد:
-    1. **لو المنتج موجود:** جاوب بالسعر والتفاصيل باختصار.
-    2. **لو المنتج غير موجود / أو الاسم مش مفهوم / أو العميل طلب المنيو:**
-       🚨 لا تقل "لا أعرف" وتسكت.
-       🚨 بدلاً من ذلك، قل: "للأسف المنتج ده مش واضح عندي دلوقتي، لكن تقدر تشوف المنيو الكامل هنا 👇"
-       ثم انسخ قسم "روابط المنيو والكتالوجات" الموجود في البيانات كما هو بالضبط.
-    
-    3. اللهجة: مصرية ودودة.
-    
-    سياق سابق:
-    {chat_context}
-    
+    تعليمات صارمة:
+    1. ابحث في قسم "تحديثات جديدة" أولاً، لأنها تلغي الأسعار القديمة.
+    2. لو العميل سأل عن صنف (مثل "كنافة")، اعرض كل الأنواع المتاحة وأسعارها.
+    3. خليك مختصر ومفيد.
+    4. لو المعلومة مش موجودة قول: "المعلومة دي مش عندي حالياً".
+
     سؤال العميل: {user_msg}
-    الرد:
     """
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -86,16 +105,9 @@ async def generate_reply(user_id: str, user_msg: str):
         try:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 200:
-                reply_text = response.json()["choices"][0]["message"]["content"].strip()
-                
-                # حفظ في الذاكرة
-                history.append({"role": "User", "content": user_msg})
-                history.append({"role": "Bot", "content": reply_text})
-                conversations[user_id] = history[-10:]
-                
-                return reply_text
+                return response.json()["choices"][0]["message"]["content"].strip()
             else:
-                return "معلش في عطل فني بسيط، ثواني وراجعلك."
+                return "معلش في عطل فني بسيط."
         except:
             return "النظام مشغول حالياً."
 
