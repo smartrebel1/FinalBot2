@@ -1,6 +1,6 @@
 fastapi
-uvicorn[standard]
-python-dotenv
-httpx
+uvicorn
 requests
-rapidfuzz
+httpx
+python-dotenv
+unidecode
