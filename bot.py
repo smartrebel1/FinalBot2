@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 
-# 1. إعداد السجلات (Logging)
+# 1. إعداد السجلات (عشان نشوف البوت بيعمل إيه في الخلفية)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
@@ -19,12 +19,12 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("REPO_NAME")
 
 # إعدادات الملف والموديل
-FILE_PATH = "data.txt"  # اسم ملف الداتا في جيت هاب
+FILE_PATH = "data.txt"  
 MODEL = "llama-3.1-8b-instant"
 
 app = FastAPI()
 
-# 3. قراءة البيانات محلياً عند بدء التشغيل
+# 3. قراءة البيانات محلياً عند التشغيل
 try:
     with open(FILE_PATH, "r", encoding="utf-8") as f:
         KNOWLEDGE_BASE = f.read()
@@ -45,41 +45,39 @@ def verify(request: Request):
         return int(challenge)
     raise HTTPException(status_code=403)
 
-# 🟢 4. دالة التحديث المباشر على GitHub (مع كشف الأخطاء)
+# 🟢 4. دالة التحديث المباشر على GitHub
 def update_github_file(new_info):
-    # طباعة معلومات المتغيرات في اللوج للمساعدة في الحل
-    logger.info(f"🔍 DEBUG CHECK: REPO_NAME = '{REPO_NAME}'")
-    logger.info(f"🔍 DEBUG CHECK: TOKEN Length = {len(GITHUB_TOKEN) if GITHUB_TOKEN else 0}")
+    # طباعة في اللوج للتأكد من المتغيرات
+    logger.info(f"🔍 Checking GitHub Vars: Repo={REPO_NAME}, Token_Len={len(str(GITHUB_TOKEN))}")
 
-    # التحقق من وجود المتغيرات
     if not GITHUB_TOKEN or not REPO_NAME:
-        return f"⚠️ إعدادات GitHub ناقصة في Railway.\nRepo: {REPO_NAME}\nToken: {'موجود' if GITHUB_TOKEN else 'غير موجود'}"
+        return "⚠️ إعدادات GitHub (Token/Repo) ناقصة في Railway."
 
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     try:
-        # أ) جلب الملف الحالي (للحصول على SHA)
+        # أ) جلب الملف الحالي
         get_resp = requests.get(url, headers=headers)
         
         if get_resp.status_code == 404:
-            return f"❌ خطأ 404: مش لاقي ملف اسمه {FILE_PATH} في {REPO_NAME}.\nتأكد إن اسم الملف في GitHub مطابق للكود."
+            return f"❌ خطأ 404: الملف {FILE_PATH} غير موجود في {REPO_NAME}."
+        elif get_resp.status_code == 403:
+            return "❌ خطأ 403: التوكن لا يملك صلاحية التعديل (Repo Scope Missing)."
         elif get_resp.status_code == 401:
-            return "❌ خطأ 401: التوكن (Token) غلط أو منتهي الصلاحية."
-        elif get_resp.status_code != 200:
-            return f"❌ خطأ في قراءة GitHub: {get_resp.status_code} - {get_resp.text}"
+            return "❌ خطأ 401: التوكن غير صحيح."
         
         file_data = get_resp.json()
         sha = file_data['sha']
         
-        # ب) فك التشفير وإضافة المعلومة
+        # ب) فك التشفير وإضافة التحديث
         old_content = base64.b64decode(file_data['content']).decode('utf-8')
         updated_content = f"{old_content}\n\n=== 🆕 تحديث جديد ===\n- {new_info}"
         
         # ج) التشفير مرة أخرى
         encoded_content = base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
 
-        # د) إرسال التحديث (Commit)
+        # د) إرسال التحديث
         data = {
             "message": f"Bot learned: {new_info}", 
             "content": encoded_content,
@@ -89,37 +87,51 @@ def update_github_file(new_info):
         put_resp = requests.put(url, headers=headers, json=data)
         
         if put_resp.status_code == 200:
-            return "✅ تمام يا ريس! عدلت ملف الداتا بنفسي على GitHub.\n(البوت هيعمل ريستارت دقيقة واحدة عشان يحدث معلوماته)."
-        elif put_resp.status_code == 403:
-            return "❌ خطأ 403: التوكن ده (Read-only) ملوش صلاحية الكتابة. لازم تعمل توكن جديد وتعلم على 'repo'."
+            return "✅ تمام يا ريس! تم حفظ المعلومة في GitHub.\n(سيتم إعادة تشغيل البوت تلقائياً لتحديث البيانات)."
         else:
-            return f"❌ خطأ في الحفظ: {put_resp.status_code} - {put_resp.text}"
+            return f"❌ فشل الحفظ: {put_resp.status_code} - {put_resp.text}"
 
     except Exception as e:
         return f"❌ خطأ في الاتصال: {e}"
 
 # 5. منطق الرد والذكاء
 async def generate_reply(user_id: str, user_msg: str):
-    # أمر التعليم
-    if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
-        info = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
-        if len(info) < 2: return "اكتب المعلومة بعد كلمة اتعلم."
+    # تنظيف النص
+    msg = user_msg.strip()
+    logger.info(f"📩 Received Message: '{msg}'")
+
+    # --- الكشف عن أوامر التعليم ---
+    # يقبل: #تحديث، #learn، اتعلم، تعلم
+    triggers = ["#تحديث", "#learn", "اتعلم", "تعلم"]
+    
+    if any(msg.startswith(t) for t in triggers):
+        # استخراج المعلومة بحذف كلمة الأمر
+        info = msg
+        for t in triggers:
+            info = info.replace(t, "")
+        
+        info = info.strip()
+        logger.info(f"⚙️ Learning Triggered. Content: {info}")
+
+        if len(info) < 2: 
+            return "اكتب المعلومة بعد الأمر. مثال: #تحديث السعر زاد."
+            
         return update_github_file(info)
 
-    # الرد الطبيعي
+    # --- الرد الطبيعي (Groq AI) ---
     system_prompt = f"""
-    أنت موظف خدمة عملاء لشركة "حلويات مصر".
+    أنت موظف خدمة عملاء لشركة "حلويات مصر" (Misr Sweets).
     
     مرجعك للمعلومات:
     === DATA ===
     {KNOWLEDGE_BASE}
     ============
 
-    تعليمات الرد:
+    تعليمات صارمة:
     1. **المجاملات:** رد بترحيب وذوق فوراً (أهلاً بك يا فندم 💜).
-    2. **المنيو:** لو طلب المنيو، انسخ قسم "روابط المنيو" فقط.
+    2. **المنيو:** لو طلب المنيو، انسخ قسم "روابط المنيو والكتالوجات" فقط.
     3. **التوصيل:** التزم بنص التوصيل الموجود في الداتا.
-    4. **التحديثات:** ابحث في آخر الملف عن أي تحديثات جديدة لأنها الأهم.
+    4. **التحديثات:** انظر في آخر الملف عن أي تحديثات جديدة.
     5. **عدم المعرفة:** لو المعلومة مش موجودة، قول: "للأسف المعلومة دي مش واضحة حالياً".
 
     سؤال العميل: {user_msg}
@@ -142,8 +154,10 @@ async def generate_reply(user_id: str, user_msg: str):
             elif response.status_code == 429:
                 return "معلش في ضغط على السيرفر، ثواني وجرب تاني."
             else:
+                logger.error(f"Groq Error: {response.text}")
                 return "معلش ثواني وراجعلك (عطل فني بسيط) 💜"
-        except:
+        except Exception as e:
+            logger.error(f"Connection Error: {e}")
             return "النظام مشغول حالياً."
 
 @app.post("/webhook")
