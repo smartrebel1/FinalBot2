@@ -1,46 +1,37 @@
 import os
 import logging
 import requests
+import base64
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 
-# إعداد السجلات
+# 1. إعداد السجلات
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-# المتغيرات
+# 2. تحميل المتغيرات من Railway
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # مفتاح جيت هاب
+REPO_NAME = os.getenv("REPO_NAME")        # اسم المستودع (user/repo)
+
+# الموديل السريع
 MODEL = "llama-3.1-8b-instant"
+# اسم ملف الداتا اللي هنعدله
+FILE_PATH = "data.txt"
 
 app = FastAPI()
 
-# ذاكرة المحادثات (تخزين آخر 5 رسائل لكل مستخدم)
-conversations = {}
-MEMORY_FILE = "memory.txt"
-
-# قراءة البيانات
+# 3. قراءة البيانات الحالية عند التشغيل
 try:
-    with open("data.txt", "r", encoding="utf-8") as f:
-        BASE_KNOWLEDGE = f.read()
+    with open(FILE_PATH, "r", encoding="utf-8") as f:
+        KNOWLEDGE_BASE = f.read()
     logger.info("✅ Data loaded successfully")
-except Exception as e:
-    BASE_KNOWLEDGE = "لا توجد بيانات."
-
-def get_full_knowledge():
-    memory_content = ""
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            memory_content = f.read()
-    return f"{BASE_KNOWLEDGE}\n=== معلومات جديدة تم تعلمها ===\n{memory_content}"
-
-def learn_new_info(info):
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n- {info}")
-    return "تمام، حفظت المعلومة دي في ذاكرتي! 🧠✅"
+except:
+    KNOWLEDGE_BASE = "لا توجد بيانات."
 
 @app.get("/")
 def home():
@@ -55,38 +46,81 @@ def verify(request: Request):
         return int(challenge)
     raise HTTPException(status_code=403)
 
+# 🟢 4. الدالة السحرية: التحديث المباشر على GitHub
+def update_github_file(new_info):
+    if not GITHUB_TOKEN or not REPO_NAME:
+        return "⚠️ فيه مشكلة في إعدادات GitHub في Railway. تأكد من المتغيرات."
+
+    # رابط API الخاص بملف الداتا
+    url = f"https://api.github.com/repos/{REPO_NAME}/contents/{FILE_PATH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
+    try:
+        # أ) نجيب الملف الحالي عشان ناخد الـ SHA (بصمة الملف)
+        get_resp = requests.get(url, headers=headers)
+        if get_resp.status_code != 200:
+            return "❌ مش عارف أوصل لملف الداتا على GitHub."
+        
+        file_data = get_resp.json()
+        sha = file_data['sha']
+        
+        # ب) نفك تشفير المحتوى القديم ونضيف عليه الجديد
+        old_content = base64.b64decode(file_data['content']).decode('utf-8')
+        
+        # بنضيف المعلومة الجديدة في آخر الملف بتاريخ اليوم
+        updated_content = f"{old_content}\n\n=== 🆕 تحديث جديد ===\n- {new_info}"
+        
+        # ج) نشفر المحتوى الجديد (Base64) عشان GitHub بيفهم كده
+        encoded_content = base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
+
+        # د) نبعت التحديث (Push/Commit)
+        data = {
+            "message": f"Bot learned: {new_info}", # رسالة الـ commit
+            "content": encoded_content,
+            "sha": sha
+        }
+        
+        put_resp = requests.put(url, headers=headers, json=data)
+        
+        if put_resp.status_code == 200:
+            return "✅ تمام يا ريس! عدلت ملف الداتا بنفسي على GitHub.\n(البوت هيعمل ريستارت دقيقة واحدة عشان يحدث معلوماته ويرجعلك)."
+        else:
+            return f"❌ حصل خطأ وأنا بحدث الملف: {put_resp.status_code}"
+
+    except Exception as e:
+        return f"❌ خطأ في الاتصال: {e}"
+
+# 5. منطق الرد والذكاء الاصطناعي
 async def generate_reply(user_id: str, user_msg: str):
-    # 1. أوامر التعليم
-    if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
-        return learn_new_info(user_msg.replace("اتعلم", "").replace("تعلم", "").strip())
-
-    # 2. الذاكرة
-    history = conversations.get(user_id, [])
-    chat_context = ""
-    for msg in history[-3:]: 
-        chat_context += f"- {msg['role']}: {msg['content']}\n"
     
-    full_knowledge = get_full_knowledge()
+    # -- فحص أمر التعليم --
+    # لو الرسالة بتبدأ بـ "اتعلم" أو "تعلم"
+    if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
+        # استخراج المعلومة (حذف كلمة اتعلم)
+        info_to_learn = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
+        
+        if len(info_to_learn) < 3:
+            return "اكتب المعلومة بعد كلمة 'اتعلم'، مثال: اتعلم ان التوصيل مجاني."
+            
+        # استدعاء دالة تحديث GitHub
+        return update_github_file(info_to_learn)
 
-    # 3. تعليمات البوت الذكية
+    # -- الرد الطبيعي --
     system_prompt = f"""
-    أنت موظف خدمة عملاء لشركة "حلويات مصر".
+    أنت موظف خدمة عملاء لشركة "حلويات مصر" (Misr Sweets).
     
     مرجعك الوحيد للمعلومات:
     === DATA ===
-    {full_knowledge}
+    {KNOWLEDGE_BASE}
     ============
 
-    ⚠️ قواعد الرد (صارمة جداً):
-    1. **المجاملات:** لو العميل قال (شكراً، تسلم، هاي، سلام عليكم)، رد بترحيب وذوق فوراً (مثلاً: "يا هلا بيك يا فندم 💜" أو "الشكر لله، تحت أمرك في أي وقت 💜") ولا تبحث في الأسعار.
-    2. **المنيو:** لو العميل سأل عن "المنيو" أو "القائمة"، انسخ قسم "روابط المنيو والكتالوجات" من البيانات كما هو بالضبط دون تغيير.
-    3. **التوصيل:** التزم بنص التوصيل الموجود في الداتا (طنطا غير متاح حالياً).
-    4. **الاختصار:** الإجابة تكون قصيرة ومباشرة، استخدم إيموجي (💜، 🍰).
-    5. **عدم المعرفة:** لو المعلومة مش في الداتا، قول: "للأسف المعلومة دي مش واضحة قدامي دلوقتي، ممكن تتواصل مع الفرع للتأكيد".
+    ⚠️ تعليمات صارمة للرد:
+    1. **المجاملات:** لو العميل قال (شكراً، تسلم، هاي)، رد بترحيب وذوق فوراً ولا تبحث في الأسعار.
+    2. **المنيو:** لو العميل طلب "المنيو"، انسخ قسم "روابط المنيو والكتالوجات" فقط.
+    3. **التوصيل:** التزم بنص التوصيل الموجود في الداتا.
+    4. **التحديثات:** ابحث في آخر الملف عن أي تحديثات جديدة لأنها الأهم.
+    5. **عدم المعرفة:** لو المعلومة مش موجودة، قول: "للأسف المعلومة دي مش واضحة قدامي دلوقتي".
 
-    سياق سابق:
-    {chat_context}
-    
     سؤال العميل: {user_msg}
     """
 
@@ -95,7 +129,7 @@ async def generate_reply(user_id: str, user_msg: str):
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": system_prompt}],
-        "temperature": 0.2, # تقليل الإبداع للالتزام بالنص
+        "temperature": 0.2,
         "max_tokens": 350
     }
 
@@ -103,14 +137,7 @@ async def generate_reply(user_id: str, user_msg: str):
         try:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 200:
-                reply_text = response.json()["choices"][0]["message"]["content"].strip()
-                
-                # تحديث الذاكرة
-                history.append({"role": "User", "content": user_msg})
-                history.append({"role": "Bot", "content": reply_text})
-                conversations[user_id] = history[-10:]
-                
-                return reply_text
+                return response.json()["choices"][0]["message"]["content"].strip()
             else:
                 return "معلش ثواني وراجعلك (ضغط شبكة) 💜"
         except:
@@ -120,17 +147,24 @@ async def generate_reply(user_id: str, user_msg: str):
 async def webhook(request: Request):
     body = await request.json()
     if body.get("object") == "page":
-        for entry in body["entry"]:
+        for entry in body.get("entry", []):
             for msg in entry.get("messaging", []):
                 if "message" in msg and "text" in msg["message"]:
                     sender = msg["sender"]["id"]
                     text = msg["message"]["text"]
+                    # الرد
                     reply = await generate_reply(sender, text)
                     send_message(sender, reply)
         return JSONResponse({"status": "ok"}, status_code=200)
     return JSONResponse({"status": "ignored"}, status_code=200)
 
 def send_message(user_id, text):
+    if not PAGE_TOKEN:
+        return
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
     payload = {"recipient": {"id": user_id}, "message": {"text": text}}
     requests.post(url, json=payload)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
