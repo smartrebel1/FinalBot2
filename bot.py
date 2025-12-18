@@ -7,26 +7,24 @@ from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 
-# 1. إعداد السجلات
+# إعداد السجلات
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-# 2. تحميل المتغيرات من Railway
+# المتغيرات
 VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN")
 PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # مفتاح جيت هاب
-REPO_NAME = os.getenv("REPO_NAME")        # اسم المستودع (user/repo)
-
-# الموديل السريع
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_NAME = os.getenv("REPO_NAME")
+FILE_PATH = "data.txt" # تأكد إن ده نفس اسم الملف عندك
 MODEL = "llama-3.1-8b-instant"
-# اسم ملف الداتا اللي هنعدله
-FILE_PATH = "data.txt"
 
 app = FastAPI()
 
-# 3. قراءة البيانات الحالية عند التشغيل
+# قراءة البيانات
 try:
+    # محاولة قراءة محلية أولاً
     with open(FILE_PATH, "r", encoding="utf-8") as f:
         KNOWLEDGE_BASE = f.read()
     logger.info("✅ Data loaded successfully")
@@ -35,7 +33,7 @@ except:
 
 @app.get("/")
 def home():
-    return {"status": "alive", "model": MODEL}
+    return {"status": "alive", "repo": REPO_NAME}
 
 @app.get("/webhook")
 def verify(request: Request):
@@ -46,36 +44,36 @@ def verify(request: Request):
         return int(challenge)
     raise HTTPException(status_code=403)
 
-# 🟢 4. الدالة السحرية: التحديث المباشر على GitHub
+# 🟢 دالة التحديث على GitHub (مع كشف الأخطاء)
 def update_github_file(new_info):
     if not GITHUB_TOKEN or not REPO_NAME:
-        return "⚠️ فيه مشكلة في إعدادات GitHub في Railway. تأكد من المتغيرات."
+        return "⚠️ إعدادات GitHub (Token/Repo) ناقصة في Railway."
 
-    # رابط API الخاص بملف الداتا
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     try:
-        # أ) نجيب الملف الحالي عشان ناخد الـ SHA (بصمة الملف)
+        # 1. محاولة جلب الملف
         get_resp = requests.get(url, headers=headers)
-        if get_resp.status_code != 200:
-            return "❌ مش عارف أوصل لملف الداتا على GitHub."
+        
+        if get_resp.status_code == 404:
+            return f"❌ خطأ 404: مش لاقي ملف اسمه {FILE_PATH} في المستودع {REPO_NAME}."
+        elif get_resp.status_code == 401:
+            return "❌ خطأ 401: التوكن غلط أو صلاحيته انتهت."
+        elif get_resp.status_code != 200:
+            return f"❌ خطأ في القراءة: {get_resp.status_code} - {get_resp.text}"
         
         file_data = get_resp.json()
         sha = file_data['sha']
         
-        # ب) نفك تشفير المحتوى القديم ونضيف عليه الجديد
+        # 2. التعديل
         old_content = base64.b64decode(file_data['content']).decode('utf-8')
-        
-        # بنضيف المعلومة الجديدة في آخر الملف بتاريخ اليوم
-        updated_content = f"{old_content}\n\n=== 🆕 تحديث جديد ===\n- {new_info}"
-        
-        # ج) نشفر المحتوى الجديد (Base64) عشان GitHub بيفهم كده
+        updated_content = f"{old_content}\n\n=== 🆕 {new_info}"
         encoded_content = base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
 
-        # د) نبعت التحديث (Push/Commit)
+        # 3. الحفظ
         data = {
-            "message": f"Bot learned: {new_info}", # رسالة الـ commit
+            "message": f"Bot learned: {new_info}",
             "content": encoded_content,
             "sha": sha
         }
@@ -83,44 +81,31 @@ def update_github_file(new_info):
         put_resp = requests.put(url, headers=headers, json=data)
         
         if put_resp.status_code == 200:
-            return "✅ تمام يا ريس! عدلت ملف الداتا بنفسي على GitHub.\n(البوت هيعمل ريستارت دقيقة واحدة عشان يحدث معلوماته ويرجعلك)."
+            return "✅ تم الحفظ في GitHub بنجاح! (انتظر دقيقة للتحديث)."
         else:
-            return f"❌ حصل خطأ وأنا بحدث الملف: {put_resp.status_code}"
+            return f"❌ خطأ في الحفظ: {put_resp.status_code} - {put_resp.text}"
 
     except Exception as e:
         return f"❌ خطأ في الاتصال: {e}"
 
-# 5. منطق الرد والذكاء الاصطناعي
 async def generate_reply(user_id: str, user_msg: str):
-    
-    # -- فحص أمر التعليم --
-    # لو الرسالة بتبدأ بـ "اتعلم" أو "تعلم"
+    # أمر التعليم
     if user_msg.strip().startswith("اتعلم") or user_msg.strip().startswith("تعلم"):
-        # استخراج المعلومة (حذف كلمة اتعلم)
-        info_to_learn = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
-        
-        if len(info_to_learn) < 3:
-            return "اكتب المعلومة بعد كلمة 'اتعلم'، مثال: اتعلم ان التوصيل مجاني."
-            
-        # استدعاء دالة تحديث GitHub
-        return update_github_file(info_to_learn)
+        info = user_msg.replace("اتعلم", "").replace("تعلم", "").strip()
+        if len(info) < 3: return "اكتب المعلومة، مثال: اتعلم كذا كذا"
+        return update_github_file(info)
 
-    # -- الرد الطبيعي --
+    # الرد الطبيعي
     system_prompt = f"""
-    أنت موظف خدمة عملاء لشركة "حلويات مصر" (Misr Sweets).
-    
-    مرجعك الوحيد للمعلومات:
-    === DATA ===
+    أنت موظف خدمة عملاء لشركة "حلويات مصر".
+    معلوماتك:
     {KNOWLEDGE_BASE}
-    ============
-
-    ⚠️ تعليمات صارمة للرد:
-    1. **المجاملات:** لو العميل قال (شكراً، تسلم، هاي)، رد بترحيب وذوق فوراً ولا تبحث في الأسعار.
-    2. **المنيو:** لو العميل طلب "المنيو"، انسخ قسم "روابط المنيو والكتالوجات" فقط.
-    3. **التوصيل:** التزم بنص التوصيل الموجود في الداتا.
-    4. **التحديثات:** ابحث في آخر الملف عن أي تحديثات جديدة لأنها الأهم.
-    5. **عدم المعرفة:** لو المعلومة مش موجودة، قول: "للأسف المعلومة دي مش واضحة قدامي دلوقتي".
-
+    
+    تعليمات:
+    1. رد باختصار وود.
+    2. لو طلب المنيو ابعت اللينكات.
+    3. ابحث في آخر الملف عن التحديثات.
+    
     سؤال العميل: {user_msg}
     """
 
@@ -130,7 +115,7 @@ async def generate_reply(user_id: str, user_msg: str):
         "model": MODEL,
         "messages": [{"role": "user", "content": system_prompt}],
         "temperature": 0.2,
-        "max_tokens": 350
+        "max_tokens": 300
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
@@ -139,9 +124,9 @@ async def generate_reply(user_id: str, user_msg: str):
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"].strip()
             else:
-                return "معلش ثواني وراجعلك (ضغط شبكة) 💜"
+                return "معلش ثواني."
         except:
-            return "النظام مشغول حالياً."
+            return "النظام مشغول."
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -152,15 +137,12 @@ async def webhook(request: Request):
                 if "message" in msg and "text" in msg["message"]:
                     sender = msg["sender"]["id"]
                     text = msg["message"]["text"]
-                    # الرد
                     reply = await generate_reply(sender, text)
                     send_message(sender, reply)
         return JSONResponse({"status": "ok"}, status_code=200)
     return JSONResponse({"status": "ignored"}, status_code=200)
 
 def send_message(user_id, text):
-    if not PAGE_TOKEN:
-        return
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_TOKEN}"
     payload = {"recipient": {"id": user_id}, "message": {"text": text}}
     requests.post(url, json=payload)
