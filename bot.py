@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 from datetime import datetime
-import pytz # مكتبة التوقيت
+import pytz 
 
 # 1. إعداد السجلات
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +23,10 @@ REPO_NAME = os.getenv("REPO_NAME")
 FILE_PATH = "data.txt"  
 MODEL = "llama-3.1-8b-instant"
 
+# 🛑 قائمة المستخدمين الموقوفين مؤقتاً (عشان الأدمن يرد)
+# (دي ذاكرة في الرامات، لو السيرفر رستر هتتمسح، وده طبيعي)
+PAUSED_USERS = set()
+
 app = FastAPI()
 
 # 3. قراءة البيانات
@@ -31,11 +35,11 @@ try:
         KNOWLEDGE_BASE = f.read()
     logger.info("✅ Data loaded successfully")
 except:
-    KNOWLEDGE_BASE = "لا توجد بيانات متاحة حالياً."
+    KNOWLEDGE_BASE = "لا توجد بيانات."
 
 @app.get("/")
 def home():
-    return {"status": "alive", "repo": REPO_NAME}
+    return {"status": "alive", "model": MODEL}
 
 @app.get("/webhook")
 def verify(request: Request):
@@ -50,68 +54,78 @@ def verify(request: Request):
 def update_github_file(new_info):
     if not GITHUB_TOKEN or not REPO_NAME:
         return "⚠️ إعدادات GitHub ناقصة."
-
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-
     try:
         get_resp = requests.get(url, headers=headers)
         if get_resp.status_code != 200: return "❌ خطأ في الوصول للملف."
-        
         file_data = get_resp.json()
         sha = file_data['sha']
-        
         old_content = base64.b64decode(file_data['content']).decode('utf-8')
         updated_content = f"{old_content}\n\n=== 🆕 تحديث جديد ===\n- {new_info}"
         encoded_content = base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
-
         data = {"message": f"Bot learned: {new_info}", "content": encoded_content, "sha": sha}
         requests.put(url, headers=headers, json=data)
-        return "✅ تمام يا ريس! تم حفظ المعلومة."
+        return "✅ تم الحفظ."
     except Exception as e:
         return f"❌ خطأ: {e}"
 
-# 🟢 دالة التحقق من الوقت (وضع الليل)
-def get_time_instructions():
-    # تحديد توقيت مصر
-    cairo_tz = pytz.timezone('Africa/Cairo')
-    now = datetime.now(cairo_tz)
-    current_hour = now.hour
-
-    # لو الساعة أكبر من أو تساوي 21 (9 مساءً) أو أقل من 8 (8 صباحاً)
-    if current_hour >= 21 or current_hour < 8:
-        return """
-        🚨 **تنبيه هام جداً (الوضع الليلي):**
-        الوقت الآن متأخر (خارج مواعيد العمل الرسمية).
-        يجب أن تضيف هذه الفقرة في بداية ردك مهما كان السؤال:
-        "أهلاً بك 👋، نحن الآن خارج مواعيد العمل الرسمية. أنا المساعد الآلي موجود للرد على استفساراتك، ولطلب أوردر يرجى ترك تفاصيلك وسيقوم أحد ممثلي خدمة العملاء بالرد عليك في الصباح 💜."
-        
-        ثم جاوب على سؤاله (السعر أو التفاصيل) بشكل طبيعي، واختم الرسالة بروابط المنيو دائماً.
-        """
-    return "" # لو في وقت العمل العادي، مفيش تعليمات إضافية
-
+# 🟢 المنطق الرئيسي للرد
 async def generate_reply(user_id: str, user_msg: str):
-    # أمر التعليم
-    if user_msg.strip().startswith(("#تحديث", "اتعلم")):
-        info = user_msg.replace("#تحديث", "").replace("اتعلم", "").strip()
+    msg = user_msg.strip()
+
+    # 🛑 1. التحكم اليدوي (Stop/Start)
+    # لو الأدمن (أو أي حد) كتب "توقف" في الشات، البوت هيسكت لليوزر ده
+    if msg.lower() in ["توقف", "stop", "بس", "اسكت"]:
+        PAUSED_USERS.add(user_id)
+        return "🛑 تم إيقاف البوت لهذا المستخدم. للتشغيل مرة أخرى اكتب 'اشتغل' أو 'start'."
+    
+    if msg.lower() in ["اشتغل", "start", "رد", "عمل"]:
+        if user_id in PAUSED_USERS:
+            PAUSED_USERS.remove(user_id)
+            return "✅ تم تفعيل البوت مرة أخرى."
+        else:
+            return "✅ البوت يعمل بالفعل."
+
+    # لو المستخدم في قائمة الإيقاف، البوت مش هيرد خالص (عشان الأدمن يرد)
+    if user_id in PAUSED_USERS:
+        return None
+
+    # 🛠️ 2. أوامر التعليم (تحديث GitHub)
+    if msg.startswith(("#تحديث", "اتعلم")):
+        info = msg.replace("#تحديث", "").replace("اتعلم", "").strip()
         return update_github_file(info)
 
-    # جلب تعليمات الوقت
-    time_instruction = get_time_instructions()
+    # 🌙 3. الوضع الليلي الصارم (بدون ذكاء اصطناعي)
+    # من 9 مساءً (21) إلى 8 صباحاً (8)
+    cairo_tz = pytz.timezone('Africa/Cairo')
+    now = datetime.now(cairo_tz)
+    
+    if now.hour >= 21 or now.hour < 8:
+        # رد ثابت لا يتغير ولا يروح لـ Groq
+        return """أهلاً بك 👋
+احنا حالياً خارج مواعيد العمل الرسمية (المواعيد من 8 ص لـ 10 م).
+أنا المساعد الآلي، وده المنيو بتاعنا تقدر تطلبه أونلاين:
 
-    # الرد الطبيعي
+‏‎📜 منيو الحلويات المصرية: https://photos.app.goo.gl/g9TAxC6JVSDzgiJz5
+‏‎📜 منيو الحلويات الشرقية: https://photos.app.goo.gl/vjpdMm5fWB2uEJLR8
+‏‎📜 التورت: https://photos.app.goo.gl/SC4yEAHKjpSLZs4z5
+📜 كل الكتالوجات: https://misrsweets.com/catalogs/
+
+سيب طلبك وهيتم التواصل معاك في الصباح فوراً 💜"""
+
+    # ☀️ 4. الوضع النهاري (ذكاء اصطناعي مختصر جداً)
     system_prompt = f"""
-    أنت موظف خدمة عملاء لشركة "حلويات مصر".
+    أنت نظام رد آلي لـ "حلويات مصر".
     
     البيانات:
     {KNOWLEDGE_BASE}
     
-    {time_instruction}
-
-    تعليمات عامة:
-    1. خليك ودود ومختصر.
-    2. لو العميل طلب المنيو ابعت اللينكات.
-    3. لو الوقت متأخر (حسب تنبيه الوضع الليلي بالأعلى)، نفذ التعليمات المذكورة هناك بدقة.
+    ⚠️ تعليمات الرد (صارمة جداً):
+    1. **الاختصار:** العميل لا يحب الكلام الكثير. جاوب على قد السؤال بالظبط (السعر والنوع).
+    2. **بدون مقدمات:** لا تقل (أهلاً بك، يسعدنا، ...) إلا في أول رسالة فقط. ادخل في الموضوع فوراً.
+    3. **المنيو:** لو السؤال عن المنيو، انسخ الروابط فقط.
+    4. **عدم التوفر:** لو الصنف غير موجود، قل "غير متاح حالياً" فقط.
 
     سؤال العميل: {user_msg}
     """
@@ -121,8 +135,8 @@ async def generate_reply(user_id: str, user_msg: str):
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": system_prompt}],
-        "temperature": 0.3,
-        "max_tokens": 450
+        "temperature": 0.1, # تجميد الإبداع للالتزام بالنص
+        "max_tokens": 200   # تقليل عدد الكلمات
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
@@ -130,10 +144,9 @@ async def generate_reply(user_id: str, user_msg: str):
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"].strip()
-            else:
-                return "معلش ثواني وراجعلك."
+            return None
         except:
-            return "النظام مشغول."
+            return None
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -144,8 +157,14 @@ async def webhook(request: Request):
                 if "message" in msg and "text" in msg["message"]:
                     sender = msg["sender"]["id"]
                     text = msg["message"]["text"]
+                    
+                    # استدعاء دالة الرد
                     reply = await generate_reply(sender, text)
-                    send_message(sender, reply)
+                    
+                    # إرسال الرد فقط لو فيه رد (عشان خاصية الإيقاف)
+                    if reply:
+                        send_message(sender, reply)
+                        
         return JSONResponse({"status": "ok"}, status_code=200)
     return JSONResponse({"status": "ignored"}, status_code=200)
 
